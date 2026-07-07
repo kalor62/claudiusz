@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Live tab rebuilt as a mission-control dashboard: large double-framed panels
+  for active sessions (status, current step, last prompt, token stats) with
+  recent work grouped into human-scale steps (`Edit ×3`, failures marked ✗),
+  a today-totals strip, and a compact idle-session list — replacing the raw
+  event feed. Phosphor-green theme with cyan/amber accents.
+- Header tabs are now unnumbered (LIVE / SESSIONS / TIPS / PROJECTS / STATS);
+  1-5 shortcuts unchanged.
+- Session status is authoritative from Claude Code's state file (`busy` means
+  working even mid-long-turn); the stale-heartbeat downgrade is gone.
+- `SessionSummary.status` is a typed enum end-to-end (same JSON wire format).
+- Expensive TUI data (audits, tips, stats) refreshes on a 3s TTL; one session
+  snapshot per frame is shared by the header and views.
+
+### Fixed
+
+- TUI quit no longer tears the daemon down under running threads (collector
+  is stopped and joined; process exit reclaims detached HTTP threads).
+- Broadcaster subscriber lifecycle: no leak on subscribe failure, deinit
+  destroys remaining subscribers under the lock.
+- Map insertions no longer leave dangling borrowed keys on allocation
+  failure (index sessions, usage dedup, tool counts, watcher file states).
+- Tool detail truncation is UTF-8-safe; API JSON can no longer carry split
+  code points.
+- Watcher stats files by path and opens only grown ones; TUI logs route to
+  /tmp/claudiusz-tui.log instead of corrupting the raw-mode screen.
+
 ### Added
 
 - Project scaffolding: build system, CI, repository hygiene.

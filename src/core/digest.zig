@@ -102,7 +102,7 @@ fn frictionSection(w: *std.ArrayList(u8), arena: Allocator, input: Input) Alloca
     var found = false;
 
     for (input.sessions) |s| {
-        if (std.mem.eql(u8, s.status, "waiting_for_user")) {
+        if (s.status == .waiting_for_user) {
             try w.print(arena, "- session in `{s}` is waiting on the user: {s}\n", .{ s.project, s.waiting_for });
             found = true;
         }

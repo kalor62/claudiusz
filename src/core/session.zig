@@ -7,6 +7,32 @@ const event_mod = @import("event.zig");
 const Event = event_mod.Event;
 const Tokens = event_mod.Tokens;
 
+/// One step of recent session activity, kept in a fixed per-session ring so
+/// every session can show "what has it been doing" regardless of how much
+/// other traffic flowed through the global event ring.
+pub const ActivityKind = enum(u8) { prompt, responded, tool, subagent };
+
+pub const activity_capacity = 48;
+
+pub const ActivityEntry = struct {
+    ts_ms: i64 = 0,
+    kind: ActivityKind = .prompt,
+    count: u16 = 1,
+    failed: u16 = 0,
+    tool_len: u8 = 0,
+    text_len: u8 = 0,
+    tool_buf: [24]u8 = undefined,
+    text_buf: [96]u8 = undefined,
+
+    pub fn tool(e: *const ActivityEntry) []const u8 {
+        return e.tool_buf[0..e.tool_len];
+    }
+
+    pub fn text(e: *const ActivityEntry) []const u8 {
+        return e.text_buf[0..e.text_len];
+    }
+};
+
 /// Real-time state of a session's Claude Code process.
 pub const Status = enum {
     /// The agent is actively working.
@@ -48,6 +74,10 @@ pub const Session = struct {
 
     first_ts_ms: i64 = 0,
     last_ts_ms: i64 = 0,
+
+    activity: [activity_capacity]ActivityEntry = undefined,
+    activity_next: usize = 0,
+    activity_len: usize = 0,
 
     status: Status = .done,
     waiting_for: []const u8 = "",
@@ -97,6 +127,10 @@ pub const Session = struct {
         if (e.app_version.len > 0 and s.app_version.len == 0) try replace(gpa, &s.app_version, e.app_version);
         if (e.is_sidechain) {
             s.subagent_event_count += 1;
+            switch (e.payload) {
+                .tool_call, .assistant_text => s.pushActivity(.{ .kind = .subagent, .ts_ms = e.timestamp_ms }),
+                else => {},
+            }
             // Subagent tokens are real cost; everything else would overwrite the session's activity picture.
             if (e.payload != .usage) return .{};
         }
@@ -107,24 +141,34 @@ pub const Session = struct {
                 if (p.truncated or p.text.len >= 1500) s.long_prompt_count += 1;
                 try replace(gpa, &s.last_prompt, p.text);
                 try replace(gpa, &s.last_activity, "reading your prompt");
+                s.pushActivity(activityEntry(.prompt, e.timestamp_ms, "", p.text));
             },
-            .assistant_text => try replace(gpa, &s.last_activity, "responding"),
+            .assistant_text => {
+                try replace(gpa, &s.last_activity, "responding");
+                s.pushActivity(.{ .kind = .responded, .ts_ms = e.timestamp_ms });
+            },
             .tool_call => |p| {
                 s.tool_call_count += 1;
                 try bumpToolCount(gpa, &s.tool_counts, p.name);
                 const activity = try std.fmt.allocPrint(gpa, "{s} {s}", .{ p.name, p.detail });
                 gpa.free(s.last_activity);
                 s.last_activity = activity;
+                s.pushActivity(activityEntry(.tool, e.timestamp_ms, p.name, p.detail));
             },
             .tool_result => |p| {
-                if (p.ok == false) s.tool_failure_count += 1;
+                if (p.ok == false) {
+                    s.tool_failure_count += 1;
+                    s.markLastToolFailed();
+                }
             },
             .usage => |p| {
-                if (p.model.len > 0) try replaceIfChanged(gpa, &s.model, p.model);
+                // Subagents may run a different model; the session label must stay the main loop's.
+                if (p.model.len > 0 and !e.is_sidechain) try replaceIfChanged(gpa, &s.model, p.model);
                 if (p.message_id.len == 0) return .{};
-                const gop = try s.seen_usage_ids.getOrPut(gpa, p.message_id);
-                if (gop.found_existing) return .{};
-                gop.key_ptr.* = try gpa.dupe(u8, p.message_id);
+                if (s.seen_usage_ids.contains(p.message_id)) return .{};
+                const key = try gpa.dupe(u8, p.message_id);
+                errdefer gpa.free(key);
+                try s.seen_usage_ids.put(gpa, key, {});
                 s.tokens.input += p.tokens.input;
                 s.tokens.output += p.tokens.output;
                 s.tokens.cache_read += p.tokens.cache_read;
@@ -146,6 +190,51 @@ pub const Session = struct {
         return .{};
     }
 
+    /// Consecutive repeats (same tool, streamed responses, subagent bursts)
+    /// merge into the previous entry so the ring holds distinct steps, not
+    /// one noisy burst.
+    fn pushActivity(s: *Session, entry: ActivityEntry) void {
+        if (s.lastActivityEntry()) |last| {
+            const mergeable = last.kind == entry.kind and switch (entry.kind) {
+                .responded, .subagent => true,
+                .tool => std.mem.eql(u8, last.tool(), entry.tool()),
+                .prompt => false,
+            };
+            if (mergeable) {
+                last.count +|= 1;
+                last.ts_ms = entry.ts_ms;
+                if (entry.kind == .tool) {
+                    last.text_len = entry.text_len;
+                    last.text_buf = entry.text_buf;
+                }
+                return;
+            }
+        }
+        s.activity[s.activity_next] = entry;
+        s.activity_next = (s.activity_next + 1) % activity_capacity;
+        if (s.activity_len < activity_capacity) s.activity_len += 1;
+    }
+
+    fn lastActivityEntry(s: *Session) ?*ActivityEntry {
+        if (s.activity_len == 0) return null;
+        return &s.activity[(s.activity_next + activity_capacity - 1) % activity_capacity];
+    }
+
+    fn markLastToolFailed(s: *Session) void {
+        const last = s.lastActivityEntry() orelse return;
+        if (last.kind == .tool) last.failed +|= 1;
+    }
+
+    /// Copies the activity ring oldest-first into `out`; returns the slice used.
+    pub fn copyActivity(s: *const Session, out: []ActivityEntry) []ActivityEntry {
+        const count = @min(s.activity_len, out.len);
+        const start = (s.activity_next + activity_capacity - s.activity_len) % activity_capacity;
+        for (0..count) |i| {
+            out[i] = s.activity[(start + i) % activity_capacity];
+        }
+        return out[0..count];
+    }
+
     fn replace(gpa: Allocator, slot: *[]const u8, value: []const u8) Allocator.Error!void {
         const copy = try gpa.dupe(u8, value);
         gpa.free(slot.*);
@@ -162,15 +251,36 @@ pub const Session = struct {
         counts: *std.StringHashMapUnmanaged(u32),
         name: []const u8,
     ) Allocator.Error!void {
-        const gop = try counts.getOrPut(gpa, name);
-        if (gop.found_existing) {
-            gop.value_ptr.* += 1;
-        } else {
-            gop.key_ptr.* = try gpa.dupe(u8, name);
-            gop.value_ptr.* = 1;
+        if (counts.getPtr(name)) |count| {
+            count.* += 1;
+            return;
         }
+        const key = try gpa.dupe(u8, name);
+        errdefer gpa.free(key);
+        try counts.put(gpa, key, 1);
     }
 };
+
+fn activityEntry(kind: ActivityKind, ts_ms: i64, tool_name: []const u8, text: []const u8) ActivityEntry {
+    var entry = ActivityEntry{ .kind = kind, .ts_ms = ts_ms };
+    entry.tool_len = @intCast(copyUtf8Prefix(&entry.tool_buf, tool_name));
+    entry.text_len = @intCast(copyUtf8Prefix(&entry.text_buf, firstLine(text)));
+    return entry;
+}
+
+fn copyUtf8Prefix(dest: []u8, src: []const u8) usize {
+    var end = @min(src.len, dest.len);
+    if (end < src.len) {
+        while (end > 0 and src[end] & 0b1100_0000 == 0b1000_0000) end -= 1;
+    }
+    @memcpy(dest[0..end], src[0..end]);
+    return end;
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return text[0..end];
+}
 
 // --- tests ---------------------------------------------------------------
 

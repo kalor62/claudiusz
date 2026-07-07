@@ -11,12 +11,10 @@ const session_mod = @import("../core/session.zig");
 const log = std.log.scoped(.liveness);
 
 const max_state_file_bytes = 64 * 1024;
-/// A "running" process whose heartbeat went stale is considered idle.
-pub const idle_after_ms: i64 = 90_000;
 
 /// Scans `<root>/sessions` and returns live state for sessions whose process
 /// is actually alive. Results are arena-owned.
-pub fn scan(arena: Allocator, io: Io, root: []const u8, now_ms: i64) Allocator.Error![]index_mod.LiveState {
+pub fn scan(arena: Allocator, io: Io, root: []const u8) Allocator.Error![]index_mod.LiveState {
     var states: std.ArrayList(index_mod.LiveState) = .empty;
 
     const sessions_path = try std.fs.path.join(arena, &.{ root, "sessions" });
@@ -32,7 +30,7 @@ pub fn scan(arena: Allocator, io: Io, root: []const u8, now_ms: i64) Allocator.E
         return states.toOwnedSlice(arena);
     }) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
-        const state = parseStateFile(arena, io, dir, entry.name, now_ms) orelse continue;
+        const state = parseStateFile(arena, io, dir, entry.name) orelse continue;
         try states.append(arena, state);
     }
     return states.toOwnedSlice(arena);
@@ -43,7 +41,6 @@ fn parseStateFile(
     io: Io,
     dir: Io.Dir,
     name: []const u8,
-    now_ms: i64,
 ) ?index_mod.LiveState {
     const bytes = dir.readFileAlloc(io, name, arena, .limited(max_state_file_bytes)) catch |err| {
         log.debug("cannot read session state {s}: {s}", .{ name, @errorName(err) });
@@ -68,7 +65,7 @@ fn parseStateFile(
 
     return .{
         .session_id = session_id,
-        .status = mapStatus(raw_status, updated_at, now_ms),
+        .status = mapStatus(raw_status),
         .waiting_for = waiting_for,
         .pid = pid,
         .updated_at_ms = updated_at,
@@ -76,14 +73,13 @@ fn parseStateFile(
 }
 
 /// Claude Code v2.1 writes `status: busy|idle|waiting|shell` (older builds:
-/// `running`). Unknown values — and a stale "working" heartbeat — degrade to
-/// idle rather than misleading the user with a confident wrong answer.
-fn mapStatus(raw: []const u8, updated_at_ms: i64, now_ms: i64) session_mod.Status {
+/// `running`). The file is authoritative: `updatedAt` is only bumped on
+/// transitions, so a long agentic turn keeps `busy` with an old timestamp —
+/// exactly the sessions that must show as working. Unknown values degrade
+/// to idle rather than guessing.
+fn mapStatus(raw: []const u8) session_mod.Status {
     if (std.mem.eql(u8, raw, "waiting")) return .waiting_for_user;
-    if (std.mem.eql(u8, raw, "busy") or std.mem.eql(u8, raw, "running")) {
-        if (updated_at_ms > 0 and now_ms - updated_at_ms > idle_after_ms) return .idle;
-        return .working;
-    }
+    if (std.mem.eql(u8, raw, "busy") or std.mem.eql(u8, raw, "running")) return .working;
     return .idle;
 }
 
@@ -175,18 +171,18 @@ test "scan reports alive sessions and maps statuses" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
 
-    const states = try scan(arena_state.allocator(), io, root, 2000);
+    const states = try scan(arena_state.allocator(), io, root);
     try testing.expectEqual(@as(usize, 1), states.len);
     try testing.expectEqualStrings("live-1", states[0].session_id);
     try testing.expectEqual(session_mod.Status.waiting_for_user, states[0].status);
     try testing.expectEqualStrings("permission prompt", states[0].waiting_for);
 }
 
-test "mapStatus degrades stale running heartbeat to idle" {
-    try testing.expectEqual(session_mod.Status.working, mapStatus("busy", 1000, 1000 + idle_after_ms));
-    try testing.expectEqual(session_mod.Status.working, mapStatus("running", 1000, 1000 + idle_after_ms));
-    try testing.expectEqual(session_mod.Status.idle, mapStatus("busy", 1000, 1000 + idle_after_ms + 1));
-    try testing.expectEqual(session_mod.Status.waiting_for_user, mapStatus("waiting", 0, 0));
-    try testing.expectEqual(session_mod.Status.idle, mapStatus("shell", 0, 0));
-    try testing.expectEqual(session_mod.Status.idle, mapStatus("someday-new-status", 0, 0));
+test "mapStatus trusts the state file and degrades unknowns to idle" {
+    try testing.expectEqual(session_mod.Status.working, mapStatus("busy"));
+    try testing.expectEqual(session_mod.Status.working, mapStatus("running"));
+    try testing.expectEqual(session_mod.Status.waiting_for_user, mapStatus("waiting"));
+    try testing.expectEqual(session_mod.Status.idle, mapStatus("idle"));
+    try testing.expectEqual(session_mod.Status.idle, mapStatus("shell"));
+    try testing.expectEqual(session_mod.Status.idle, mapStatus("someday-new-status"));
 }

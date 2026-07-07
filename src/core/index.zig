@@ -12,7 +12,7 @@ const stats = @import("stats.zig");
 const Event = event_mod.Event;
 const Tokens = event_mod.Tokens;
 const Session = session_mod.Session;
-const Status = session_mod.Status;
+pub const Status = session_mod.Status;
 
 /// Live process state for one session, produced by the liveness scanner.
 pub const LiveState = struct {
@@ -31,14 +31,14 @@ pub const StatusChange = struct {
     waiting_for: []const u8,
 };
 
-/// Read model of a session for lists.
+/// Read model of a session for lists. `status` serializes as its tag name.
 pub const SessionSummary = struct {
     id: []const u8,
     project: []const u8,
     cwd: []const u8,
     title: []const u8,
     agent_name: []const u8,
-    status: []const u8,
+    status: Status,
     waiting_for: []const u8,
     model: []const u8,
     tokens: Tokens,
@@ -55,6 +55,16 @@ pub const SessionSummary = struct {
 };
 
 pub const ToolCount = struct { name: []const u8, count: u32 };
+
+/// One step of a session's recent activity, arena-copied for readers.
+pub const ActivityView = struct {
+    ts_ms: i64,
+    kind: session_mod.ActivityKind,
+    count: u16,
+    tool: []const u8,
+    text: []const u8,
+    failed: u16,
+};
 
 /// Read model of a session for the detail view: everything we know.
 pub const SessionDetail = struct {
@@ -127,15 +137,17 @@ pub const Index = struct {
         defer ix.mutex.unlock(io);
 
         if (owned.session_id.len > 0) {
-            const gop = try ix.sessions.getOrPut(ix.gpa, owned.session_id);
-            if (!gop.found_existing) {
-                const session = try ix.gpa.create(Session);
-                errdefer ix.gpa.destroy(session);
-                session.* = try Session.init(ix.gpa, owned.session_id);
-                gop.key_ptr.* = session.id;
-                gop.value_ptr.* = session;
-            }
-            const result = try gop.value_ptr.*.applyEvent(ix.gpa, &owned);
+            // Build the Session fully before touching the map: a half-inserted
+            // entry with a borrowed key would outlive this event on error.
+            const session = ix.sessions.get(owned.session_id) orelse blk: {
+                const created = try ix.gpa.create(Session);
+                errdefer ix.gpa.destroy(created);
+                created.* = try Session.init(ix.gpa, owned.session_id);
+                errdefer created.deinit(ix.gpa);
+                try ix.sessions.put(ix.gpa, created.id, created);
+                break :blk created;
+            };
+            const result = try session.applyEvent(ix.gpa, &owned);
             try ix.applyToDaily(&owned, result);
         }
         ix.pushRing(owned);
@@ -359,6 +371,35 @@ pub const Index = struct {
         };
     }
 
+    /// Arena-copied recent activity steps of one session, oldest first.
+    /// Backed by the per-session ring, so history survives regardless of
+    /// global event volume.
+    pub fn sessionActivity(
+        ix: *Index,
+        io: Io,
+        arena: Allocator,
+        id: []const u8,
+    ) Allocator.Error![]ActivityView {
+        ix.mutex.lockUncancelable(io);
+        defer ix.mutex.unlock(io);
+
+        const session = ix.sessions.get(id) orelse return arena.alloc(ActivityView, 0);
+        var entries: [session_mod.activity_capacity]session_mod.ActivityEntry = undefined;
+        const used = session.copyActivity(&entries);
+        var views = try arena.alloc(ActivityView, used.len);
+        for (used, 0..) |*entry, i| {
+            views[i] = .{
+                .ts_ms = entry.ts_ms,
+                .kind = entry.kind,
+                .count = entry.count,
+                .tool = try arena.dupe(u8, entry.tool()),
+                .text = try arena.dupe(u8, entry.text()),
+                .failed = entry.failed,
+            };
+        }
+        return views;
+    }
+
     /// Arena-copied views of the most recent ring events (oldest first),
     /// optionally filtered to one session.
     pub fn tailEvents(
@@ -408,7 +449,7 @@ pub const Index = struct {
             .cwd = try arena.dupe(u8, s.cwd),
             .title = try arena.dupe(u8, s.title),
             .agent_name = try arena.dupe(u8, s.agent_name),
-            .status = @tagName(s.status),
+            .status = s.status,
             .waiting_for = try arena.dupe(u8, s.waiting_for),
             .model = try arena.dupe(u8, s.model),
             .tokens = s.tokens,
@@ -432,9 +473,8 @@ pub const Index = struct {
         return a.last_ts_ms > b.last_ts_ms;
     }
 
-    fn statusRank(status: []const u8) u8 {
-        const status_enum = std.meta.stringToEnum(Status, status) orelse return 4;
-        return switch (status_enum) {
+    fn statusRank(status: Status) u8 {
+        return switch (status) {
             .working => 0,
             .waiting_for_user => 1,
             .idle => 2,
@@ -574,7 +614,7 @@ test "liveness overlay updates status and reports changes" {
     try testing.expectEqualStrings("done", changes_after_process_exit[0].status);
 
     const sessions = try ix.listSessions(io, arena);
-    try testing.expectEqualStrings("done", sessions[0].status);
+    try testing.expectEqual(session_mod.Status.done, sessions[0].status);
 }
 
 test "ring buffer evicts oldest events without leaking" {

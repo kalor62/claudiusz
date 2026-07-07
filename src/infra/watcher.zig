@@ -61,39 +61,41 @@ pub const Watcher = struct {
         defer claude_dirs.freePaths(w.gpa, paths);
 
         for (paths) |path| {
-            const gop = try w.files.getOrPut(path);
-            if (!gop.found_existing) {
-                gop.key_ptr.* = try w.gpa.dupe(u8, path);
-                gop.value_ptr.* = .{};
+            const state = w.files.getPtr(path) orelse blk: {
+                // Dupe before inserting: the map must never hold a key
+                // borrowed from this tick's path list.
+                const key = try w.gpa.dupe(u8, path);
+                errdefer w.gpa.free(key);
+                var initial = FileState{};
                 if (w.options.start_at_end and !w.first_tick_done) {
-                    gop.value_ptr.offset = fileSize(w.io, path) orelse 0;
-                    continue;
+                    initial.offset = fileSize(w.io, path) orelse 0;
                 }
-            }
-            w.readNew(path, gop.value_ptr, handler);
+                try w.files.put(key, initial);
+                break :blk w.files.getPtr(key).?;
+            };
+            w.readNew(path, state, handler);
         }
         w.first_tick_done = true;
     }
 
     fn readNew(w: *Watcher, path: []const u8, state: *FileState, handler: anytype) void {
+        // statFile first: unchanged files (the common case) cost one syscall
+        // per tick instead of open+fstat+close.
+        const size = fileSize(w.io, path) orelse return;
+        if (size < state.offset) {
+            // Transcripts are append-only; shrinkage means replacement. Start over.
+            log.debug("{s} shrank, resetting offset", .{path});
+            state.* = .{};
+        }
+        if (size == state.offset) return;
+
         var file = Io.Dir.cwd().openFile(w.io, path, .{}) catch |err| {
             log.debug("cannot open {s}: {s}", .{ path, @errorName(err) });
             return;
         };
         defer file.close(w.io);
 
-        const stat = file.stat(w.io) catch |err| {
-            log.debug("cannot stat {s}: {s}", .{ path, @errorName(err) });
-            return;
-        };
-        if (stat.size < state.offset) {
-            // Transcripts are append-only; shrinkage means replacement. Start over.
-            log.debug("{s} shrank, resetting offset", .{path});
-            state.* = .{};
-        }
-        if (stat.size == state.offset) return;
-
-        const want: usize = @intCast(@min(stat.size - state.offset, max_read_per_tick));
+        const want: usize = @intCast(@min(size - state.offset, max_read_per_tick));
         const buf = w.gpa.alloc(u8, want) catch |err| {
             log.warn("cannot allocate {d} bytes for {s}: {s}", .{ want, path, @errorName(err) });
             return;

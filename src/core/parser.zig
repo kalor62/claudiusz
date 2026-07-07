@@ -249,13 +249,13 @@ fn toolCallDetail(gpa: Allocator, input_value: ?std.json.Value) Allocator.Error!
         try out.appendSlice(gpa, entry.key_ptr.*);
         try out.append(gpa, '=');
         switch (entry.value_ptr.*) {
-            .string => |s| try out.appendSlice(gpa, s[0..@min(s.len, 80)]),
+            .string => |s| try out.appendSlice(gpa, s[0..utf8SafeEnd(s, 80)]),
             .integer => |i| try out.print(gpa, "{d}", .{i}),
             .bool => |flag| try out.appendSlice(gpa, if (flag) "true" else "false"),
             else => try out.appendSlice(gpa, "..."),
         }
     }
-    if (out.items.len > max_detail_len) out.shrinkRetainingCapacity(max_detail_len);
+    if (out.items.len > max_detail_len) out.shrinkRetainingCapacity(utf8SafeEnd(out.items, max_detail_len));
     return out.toOwnedSlice(gpa);
 }
 
@@ -283,9 +283,15 @@ const TruncatedCopy = struct { text: []const u8, truncated: bool };
 /// code point.
 fn dupeTruncated(gpa: Allocator, text: []const u8, max: usize) Allocator.Error!TruncatedCopy {
     if (text.len <= max) return .{ .text = try gpa.dupe(u8, text), .truncated = false };
+    return .{ .text = try gpa.dupe(u8, text[0..utf8SafeEnd(text, max)]), .truncated = true };
+}
+
+/// Largest cut point ≤ `max` that does not split a UTF-8 code point.
+fn utf8SafeEnd(text: []const u8, max: usize) usize {
+    if (text.len <= max) return text.len;
     var end = max;
     while (end > 0 and text[end] & 0b1100_0000 == 0b1000_0000) end -= 1;
-    return .{ .text = try gpa.dupe(u8, text[0..end]), .truncated = true };
+    return end;
 }
 
 fn asObject(value: std.json.Value) ?std.json.ObjectMap {

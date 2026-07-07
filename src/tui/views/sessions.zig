@@ -10,6 +10,7 @@ const index_mod = @import("../../core/index.zig");
 const time_mod = @import("../../core/time.zig");
 
 const Frame = app_mod.Frame;
+const log = std.log.scoped(.tui);
 
 pub fn drawTable(frame: Frame, summaries: []const index_mod.SessionSummary, selected: usize) void {
     const screen = frame.screen;
@@ -78,14 +79,17 @@ pub fn drawDetail(frame: Frame, session_id: []const u8) Allocator.Error!void {
     y += drawField(screen, inner, y, "cc version", orDash(detail.app_version));
 
     var buf: [96]u8 = undefined;
-    const status_line = std.fmt.bufPrint(&buf, "{s}  {s}", .{ widgets.statusLabel(s.status), s.waiting_for }) catch "";
+    const status_line = std.fmt.bufPrint(&buf, "{s}  {s}", .{ widgets.statusLabel(s.status), s.waiting_for }) catch |err| blk: {
+        log.debug("detail status formatting failed: {s}", .{@errorName(err)});
+        break :blk "";
+    };
     _ = screen.writeText(inner.x, y, "status      ", .{ .dim = true }, inner.width);
     _ = screen.writeText(inner.x + 12, y, status_line, widgets.statusStyle(s.status), inner.width - 12);
     y += 1;
 
     var pid_buf: [64]u8 = undefined;
     if (detail.pid > 0) {
-        const pid_line = std.fmt.bufPrint(&pid_buf, "{d}", .{detail.pid}) catch "";
+        const pid_line = std.fmt.bufPrint(&pid_buf, "{d}", .{detail.pid}) catch unreachable;
         y += drawField(screen, inner, y, "pid", pid_line);
     }
 
@@ -96,12 +100,18 @@ pub fn drawDetail(frame: Frame, session_id: []const u8) Allocator.Error!void {
         widgets.formatTokens(&token_bufs[1], s.tokens.output),
         widgets.formatTokens(&token_bufs[2], s.tokens.cache_read),
         widgets.formatTokens(&token_bufs[3], s.tokens.cache_creation),
-    }) catch "";
+    }) catch |err| blk: {
+        log.debug("detail tokens formatting failed: {s}", .{@errorName(err)});
+        break :blk "";
+    };
     y += drawField(screen, inner, y, "tokens", stats_line);
 
     const counts_line = std.fmt.bufPrint(&stats_buf, "{d} prompts  {d} tool calls  {d} failures  {d} subagent events", .{
         s.prompt_count, s.tool_call_count, s.tool_failure_count, detail.subagent_event_count,
-    }) catch "";
+    }) catch |err| blk: {
+        log.debug("detail activity formatting failed: {s}", .{@errorName(err)});
+        break :blk "";
+    };
     y += drawField(screen, inner, y, "activity", counts_line);
 
     y += drawToolCounts(screen, inner, y, detail.tool_counts);
@@ -122,7 +132,10 @@ fn drawToolCounts(screen: *render.Screen, inner: widgets.Rect, y: u16, tool_coun
     var x = inner.x + 12;
     var buf: [48]u8 = undefined;
     for (tool_counts) |tc| {
-        const chunk = std.fmt.bufPrint(&buf, "{s}:{d}  ", .{ tc.name, tc.count }) catch continue;
+        const chunk = std.fmt.bufPrint(&buf, "{s}:{d}  ", .{ tc.name, tc.count }) catch |err| {
+            log.debug("tool count formatting failed: {s}", .{@errorName(err)});
+            continue;
+        };
         if (x + chunk.len >= inner.x + inner.width) break;
         x += screen.writeText(x, y, chunk, .{}, inner.width);
     }

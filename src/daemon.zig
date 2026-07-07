@@ -32,6 +32,7 @@ pub const Daemon = struct {
     broadcaster: broadcast.Broadcaster,
     handlers: api.Handlers,
     backfill_done: std.atomic.Value(bool) = .init(false),
+    running: std.atomic.Value(bool) = .init(true),
 
     pub fn init(d: *Daemon, gpa: Allocator, io: Io, cfg: config_mod.Config) Allocator.Error!void {
         d.* = .{
@@ -86,7 +87,7 @@ pub const Daemon = struct {
         log.info("backfill complete, watching {s}", .{d.cfg.root});
 
         var ticks: u64 = 0;
-        while (true) : (ticks += 1) {
+        while (d.running.load(.acquire)) : (ticks += 1) {
             watcher.tick(&sink) catch |err| {
                 log.warn("collector tick failed: {s}", .{@errorName(err)});
             };
@@ -99,12 +100,18 @@ pub const Daemon = struct {
         }
     }
 
+    /// Asks the collector loop to exit; join the thread returned by
+    /// `startCollector` afterwards.
+    pub fn stop(d: *Daemon) void {
+        d.running.store(false, .release);
+    }
+
     fn livenessPass(d: *Daemon) void {
         var arena_state = std.heap.ArenaAllocator.init(d.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const states = liveness.scan(arena, d.io, d.cfg.root, d.nowMs()) catch |err| {
+        const states = liveness.scan(arena, d.io, d.cfg.root) catch |err| {
             log.warn("liveness scan failed: {s}", .{@errorName(err)});
             return;
         };

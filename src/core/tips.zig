@@ -96,7 +96,7 @@ fn missingClaudeMd(ctx: *Context) Allocator.Error!void {
 /// allowlist suggests recurring permission fatigue.
 fn permissionFriction(ctx: *Context) Allocator.Error!void {
     for (ctx.input.sessions) |s| {
-        if (!std.mem.eql(u8, s.status, "waiting_for_user")) continue;
+        if (s.status != .waiting_for_user) continue;
         if (std.mem.indexOf(u8, s.waiting_for, "permission") == null) continue;
         const has_allowlist = for (ctx.input.audits) |a| {
             if (std.mem.eql(u8, a.cwd, s.cwd)) break a.has_settings_local;
@@ -215,7 +215,7 @@ fn sessionTemplate() index_mod.SessionSummary {
         .cwd = "/w/webshop",
         .title = "",
         .agent_name = "",
-        .status = "done",
+        .status = .done,
         .waiting_for = "",
         .model = "",
         .tokens = .{},
@@ -256,7 +256,7 @@ test "permission-friction fires only without a local allowlist" {
     const arena = arena_state.allocator();
 
     var blocked = sessionTemplate();
-    blocked.status = "waiting_for_user";
+    blocked.status = .waiting_for_user;
     blocked.waiting_for = "permission prompt";
 
     const bare_audit = [_]audit_mod.ProjectAudit{

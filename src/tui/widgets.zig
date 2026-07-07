@@ -7,6 +7,21 @@ const session_mod = @import("../core/session.zig");
 const Screen = render.Screen;
 const Style = render.Style;
 
+/// The dashboard palette: phosphor green as the base, cyan for the human
+/// side (prompts), amber for waiting, red for failures.
+pub const theme = struct {
+    pub const text: Style = .{ .fg = .bright_green };
+    pub const text_bold: Style = .{ .fg = .bright_green, .bold = true };
+    pub const faint: Style = .{ .fg = .green, .dim = true };
+    pub const frame: Style = .{ .fg = .green };
+    pub const accent: Style = .{ .fg = .bright_cyan };
+    pub const accent_bold: Style = .{ .fg = .bright_cyan, .bold = true };
+    pub const amber: Style = .{ .fg = .bright_yellow, .bold = true };
+    pub const alert: Style = .{ .fg = .bright_red, .bold = true };
+    pub const header_on: Style = .{ .fg = .bright_green, .reverse = true, .bold = true };
+    pub const header_off: Style = .{ .fg = .green, .reverse = true, .dim = true };
+};
+
 pub const Rect = struct {
     x: u16,
     y: u16,
@@ -19,24 +34,45 @@ pub const Rect = struct {
     }
 };
 
+const BoxGlyphs = struct {
+    tl: []const u8,
+    tr: []const u8,
+    bl: []const u8,
+    br: []const u8,
+    horizontal: []const u8,
+    vertical: []const u8,
+};
+
+const rounded_glyphs = BoxGlyphs{ .tl = "╭", .tr = "╮", .bl = "╰", .br = "╯", .horizontal = "─", .vertical = "│" };
+const heavy_glyphs = BoxGlyphs{ .tl = "╔", .tr = "╗", .bl = "╚", .br = "╝", .horizontal = "═", .vertical = "║" };
+
 pub fn drawBox(screen: *Screen, rect: Rect, title: []const u8, style: Style) void {
+    drawBoxGlyphs(screen, rect, title, style, rounded_glyphs);
+}
+
+/// Double-line frame for panels that should dominate the screen.
+pub fn drawBoxHeavy(screen: *Screen, rect: Rect, title: []const u8, style: Style) void {
+    drawBoxGlyphs(screen, rect, title, style, heavy_glyphs);
+}
+
+fn drawBoxGlyphs(screen: *Screen, rect: Rect, title: []const u8, style: Style, glyphs: BoxGlyphs) void {
     if (rect.width < 2 or rect.height < 2) return;
     const right = rect.x + rect.width - 1;
     const bottom = rect.y + rect.height - 1;
 
-    _ = screen.writeText(rect.x, rect.y, "╭", style, 1);
-    _ = screen.writeText(right, rect.y, "╮", style, 1);
-    _ = screen.writeText(rect.x, bottom, "╰", style, 1);
-    _ = screen.writeText(right, bottom, "╯", style, 1);
+    _ = screen.writeText(rect.x, rect.y, glyphs.tl, style, 1);
+    _ = screen.writeText(right, rect.y, glyphs.tr, style, 1);
+    _ = screen.writeText(rect.x, bottom, glyphs.bl, style, 1);
+    _ = screen.writeText(right, bottom, glyphs.br, style, 1);
     var x = rect.x + 1;
     while (x < right) : (x += 1) {
-        _ = screen.writeText(x, rect.y, "─", style, 1);
-        _ = screen.writeText(x, bottom, "─", style, 1);
+        _ = screen.writeText(x, rect.y, glyphs.horizontal, style, 1);
+        _ = screen.writeText(x, bottom, glyphs.horizontal, style, 1);
     }
     var y = rect.y + 1;
     while (y < bottom) : (y += 1) {
-        _ = screen.writeText(rect.x, y, "│", style, 1);
-        _ = screen.writeText(right, y, "│", style, 1);
+        _ = screen.writeText(rect.x, y, glyphs.vertical, style, 1);
+        _ = screen.writeText(right, y, glyphs.vertical, style, 1);
     }
     if (title.len > 0 and rect.width > 6) {
         _ = screen.writeText(rect.x + 2, rect.y, " ", style, 1);
@@ -45,21 +81,19 @@ pub fn drawBox(screen: *Screen, rect: Rect, title: []const u8, style: Style) voi
     }
 }
 
-pub fn statusStyle(status: []const u8) Style {
-    const status_enum = std.meta.stringToEnum(session_mod.Status, status) orelse return .{ .dim = true };
-    return switch (status_enum) {
-        .working => .{ .fg = .bright_green, .bold = true },
-        .waiting_for_user => .{ .fg = .bright_yellow, .bold = true },
+pub fn statusStyle(status: session_mod.Status) Style {
+    return switch (status) {
+        .working => theme.text_bold,
+        .waiting_for_user => theme.amber,
         .idle => .{ .fg = .bright_cyan },
-        .done => .{ .dim = true },
+        .done => theme.faint,
     };
 }
 
-pub fn statusLabel(status: []const u8) []const u8 {
-    const status_enum = std.meta.stringToEnum(session_mod.Status, status) orelse return status;
-    return switch (status_enum) {
-        .working => "● working",
-        .waiting_for_user => "◐ waiting",
+pub fn statusLabel(status: session_mod.Status) []const u8 {
+    return switch (status) {
+        .working => "● WORKING",
+        .waiting_for_user => "◐ WAITING",
         .idle => "○ idle",
         .done => "  done",
     };

@@ -1,10 +1,51 @@
 //! CLI entry point. All real logic lives in the `claudiusz` library module.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const claudiusz = @import("claudiusz");
 
 const log = std.log.scoped(.main);
+
+pub const std_options: std.Options = .{ .logFn = logToFd };
+
+/// Where log lines go: stderr (fd 2) normally, a file once the TUI owns the
+/// terminal — raw-mode escape output and stderr text cannot share a screen.
+var log_fd = std.atomic.Value(i32).init(2);
+
+pub const tui_log_path = "/tmp/claudiusz-tui.log";
+
+fn logToFd(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    var buf: [4096]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        &buf,
+        "{s}({s}): " ++ format ++ "\n",
+        .{ level.asText(), @tagName(scope) } ++ args,
+    ) catch return;
+    if (builtin.os.tag == .windows) {
+        std.debug.print("{s}", .{line});
+        return;
+    }
+    const fd = log_fd.load(.acquire);
+    var rest: []const u8 = line;
+    while (rest.len > 0) {
+        const written = std.c.write(fd, rest.ptr, rest.len);
+        if (written <= 0) return;
+        rest = rest[@intCast(written)..];
+    }
+}
+
+fn redirectLogsToFile() void {
+    if (builtin.os.tag == .windows) return;
+    const fd = std.c.open(tui_log_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return;
+    log_fd.store(fd, .release);
+}
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -53,19 +94,24 @@ fn runTui(gpa: std.mem.Allocator, io: Io, cfg: claudiusz.config.Config) !void {
         printToStderr(io, "error: the TUI needs a POSIX terminal; on Windows use `claudiusz serve` with an external frontend\n");
         std.process.exit(1);
     }
-    const daemon = try gpa.create(claudiusz.daemon.Daemon);
-    defer gpa.destroy(daemon);
-    try daemon.init(gpa, io, cfg);
-    defer daemon.deinit();
+    redirectLogsToFile();
 
+    const daemon = try gpa.create(claudiusz.daemon.Daemon);
+    try daemon.init(gpa, io, cfg);
     const collector = try daemon.startCollector();
-    collector.detach();
     const http_thread = try std.Thread.spawn(.{}, serveHttpLogged, .{daemon});
     http_thread.detach();
 
     var app = try claudiusz.tui.app.App.init(gpa, daemon);
-    defer app.deinit();
-    try app.run();
+    const run_result = app.run();
+    app.deinit();
+
+    daemon.stop();
+    collector.join();
+    try run_result;
+    // Detached HTTP threads may still hold the daemon; let process exit
+    // reclaim everything instead of freeing memory under their feet.
+    std.process.exit(0);
 }
 
 fn serveHttpLogged(daemon: *claudiusz.daemon.Daemon) void {
@@ -186,15 +232,21 @@ const EventPrinter = struct {
 fn printToStdout(io: Io, text: []const u8) void {
     var buffer: [4096]u8 = undefined;
     var writer: Io.File.Writer = .init(.stdout(), io, &buffer);
-    writer.interface.writeAll(text) catch return;
-    writer.interface.flush() catch return;
+    writeAllFlushLogged(&writer.interface, text, "stdout");
 }
 
 fn printToStderr(io: Io, text: []const u8) void {
     var buffer: [4096]u8 = undefined;
     var writer: Io.File.Writer = .init(.stderr(), io, &buffer);
-    writer.interface.writeAll(text) catch return;
-    writer.interface.flush() catch return;
+    writeAllFlushLogged(&writer.interface, text, "stderr");
+}
+
+fn writeAllFlushLogged(writer: *Io.Writer, text: []const u8, stream_name: []const u8) void {
+    writer.writeAll(text) catch |err| {
+        log.debug("{s} write failed: {s}", .{ stream_name, @errorName(err) });
+        return;
+    };
+    writer.flush() catch |err| log.debug("{s} flush failed: {s}", .{ stream_name, @errorName(err) });
 }
 
 test {

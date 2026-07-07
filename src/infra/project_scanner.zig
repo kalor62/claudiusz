@@ -61,7 +61,10 @@ fn checkFilesystem(io: Io, row: *audit.ProjectAudit) void {
 }
 
 fn fileExists(io: Io, dir: Io.Dir, sub_path: []const u8) bool {
-    _ = dir.statFile(io, sub_path, .{}) catch return false;
+    _ = dir.statFile(io, sub_path, .{}) catch |err| {
+        if (err != error.FileNotFound) log.debug("stat {s} failed: {s}", .{ sub_path, @errorName(err) });
+        return false;
+    };
     return true;
 }
 
@@ -99,7 +102,7 @@ test "scan derives projects from sessions and checks their files" {
         .cwd = "",
         .title = "",
         .agent_name = "",
-        .status = "done",
+        .status = .done,
         .waiting_for = "",
         .model = "",
         .tokens = .{},

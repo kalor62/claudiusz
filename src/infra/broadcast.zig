@@ -20,16 +20,24 @@ pub const Broadcaster = struct {
         return .{ .gpa = gpa };
     }
 
+    /// Destroys all remaining subscribers. Callers must guarantee no
+    /// subscriber thread is still alive (the daemon stops publishers first
+    /// and the TUI path exits the process instead of tearing down live SSE
+    /// connections).
     pub fn deinit(b: *Broadcaster, io: Io) void {
         b.mutex.lockUncancelable(io);
-        const subs = b.subscribers.items;
-        b.mutex.unlock(io);
-        for (subs) |sub| sub.close(io);
+        defer b.mutex.unlock(io);
+        for (b.subscribers.items) |sub| {
+            sub.close(io);
+            sub.deinit();
+            b.gpa.destroy(sub);
+        }
         b.subscribers.deinit(b.gpa);
     }
 
     pub fn subscribe(b: *Broadcaster, io: Io) Allocator.Error!*Subscriber {
         const sub = try b.gpa.create(Subscriber);
+        errdefer b.gpa.destroy(sub);
         sub.* = .{ .gpa = b.gpa };
         b.mutex.lockUncancelable(io);
         defer b.mutex.unlock(io);
