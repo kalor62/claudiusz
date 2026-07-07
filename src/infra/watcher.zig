@@ -126,8 +126,7 @@ pub const Watcher = struct {
         }
 
         if (consumed == 0 and data.len >= max_read_per_tick) {
-            // A single line longer than the per-tick budget: drop it rather
-            // than deadlock, then resync at the next newline.
+            // A line longer than the per-tick budget would deadlock the tail; drop and resync.
             log.warn("line exceeding {d} bytes in {s}, skipping it", .{ max_read_per_tick, path });
             state.skip_to_newline = true;
             state.offset += data.len;

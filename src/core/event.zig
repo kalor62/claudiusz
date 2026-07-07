@@ -51,6 +51,10 @@ pub const Event = struct {
     session_id: []const u8,
     /// Project working directory the session runs in. Empty when unknown.
     cwd: []const u8,
+    /// Git branch active in the session. Empty when unknown.
+    git_branch: []const u8,
+    /// Claude Code version that wrote the record. Empty when unknown.
+    app_version: []const u8,
     /// True for subagent (sidechain) activity.
     is_sidechain: bool,
     payload: Payload,
@@ -58,6 +62,8 @@ pub const Event = struct {
     pub fn deinit(event: *Event, gpa: Allocator) void {
         gpa.free(event.session_id);
         gpa.free(event.cwd);
+        gpa.free(event.git_branch);
+        gpa.free(event.app_version);
         switch (event.payload) {
             .prompt => |p| gpa.free(p.text),
             .assistant_text => |p| gpa.free(p.text),

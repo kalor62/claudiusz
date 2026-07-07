@@ -14,3 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JSONL parser normalizing Claude Code records into typed events.
 - `claudiusz tail` command printing the live event stream to stdout.
 - `--root` and `--port` flags for running isolated instances per config root.
+- `claudiusz serve`: headless daemon with a loopback HTTP API.
+- In-memory index: per-session aggregates (tokens deduped by message id, tool
+  usage, titles) plus a ring buffer of recent events.
+- Session liveness: `working` / `waiting_for_user` / `idle` / `done` derived
+  from `sessions/<pid>.json` heartbeats and process checks.
+- Endpoints: `/api/health`, `/api/sessions`, `/api/sessions/:id`,
+  `/api/sessions/:id/tail?n=`, and `/api/stream` (SSE live feed with
+  `session_status` change events).

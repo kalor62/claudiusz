@@ -32,11 +32,23 @@ pub fn main(init: std.process.Init) !void {
 
     switch (options.command) {
         .tail => try runTail(init.gpa, io, cfg, options.from_start),
-        .serve, .tui => {
-            printToStderr(io, "error: this command is not implemented yet; try `claudiusz tail`\n");
+        .serve => try runServe(init.gpa, io, cfg),
+        .tui => {
+            printToStderr(io, "error: the TUI is not implemented yet; try `claudiusz serve` or `claudiusz tail`\n");
             std.process.exit(1);
         },
     }
+}
+
+fn runServe(gpa: std.mem.Allocator, io: Io, cfg: claudiusz.config.Config) !void {
+    const daemon = try gpa.create(claudiusz.daemon.Daemon);
+    defer gpa.destroy(daemon);
+    try daemon.init(gpa, io, cfg);
+    defer daemon.deinit();
+
+    const collector = try daemon.startCollector();
+    collector.detach();
+    try daemon.serveHttp();
 }
 
 fn runTail(gpa: std.mem.Allocator, io: Io, cfg: claudiusz.config.Config, from_start: bool) !void {

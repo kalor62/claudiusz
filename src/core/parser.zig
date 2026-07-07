@@ -62,6 +62,8 @@ pub fn parseLine(gpa: Allocator, line: []const u8) Allocator.Error![]Event {
         .timestamp_ms = if (strField(root, "timestamp")) |t| (time_mod.parseIso8601Ms(t) orelse 0) else 0,
         .session_id = strField(root, "sessionId") orelse "",
         .cwd = strField(root, "cwd") orelse "",
+        .git_branch = strField(root, "gitBranch") orelse "",
+        .app_version = strField(root, "version") orelse "",
         .is_sidechain = boolField(root, "isSidechain") orelse false,
     };
     errdefer builder.deinit();
@@ -134,8 +136,7 @@ fn parseAssistant(b: *Builder, root: std.json.ObjectMap) Allocator.Error!void {
                 errdefer b.gpa.free(detail);
                 try b.add(.{ .tool_call = .{ .name = name, .detail = detail } });
             }
-            // Thinking blocks are deliberately not surfaced: their content is
-            // private reasoning and their signatures must never leave the machine.
+            // Thinking blocks stay private: content and signatures must never leave the machine.
         };
     }
 
@@ -194,6 +195,8 @@ const Builder = struct {
     timestamp_ms: i64,
     session_id: []const u8,
     cwd: []const u8,
+    git_branch: []const u8,
+    app_version: []const u8,
     is_sidechain: bool,
 
     /// Takes ownership of the strings inside `payload` (they must already be
@@ -203,10 +206,16 @@ const Builder = struct {
         errdefer b.gpa.free(session_id);
         const cwd = try b.gpa.dupe(u8, b.cwd);
         errdefer b.gpa.free(cwd);
+        const git_branch = try b.gpa.dupe(u8, b.git_branch);
+        errdefer b.gpa.free(git_branch);
+        const app_version = try b.gpa.dupe(u8, b.app_version);
+        errdefer b.gpa.free(app_version);
         try b.list.append(b.gpa, .{
             .timestamp_ms = b.timestamp_ms,
             .session_id = session_id,
             .cwd = cwd,
+            .git_branch = git_branch,
+            .app_version = app_version,
             .is_sidechain = b.is_sidechain,
             .payload = payload,
         });
