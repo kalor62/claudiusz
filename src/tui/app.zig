@@ -13,6 +13,8 @@ const widgets = @import("widgets.zig");
 const live_view = @import("views/live.zig");
 const sessions_view = @import("views/sessions.zig");
 const stats_view = @import("views/stats.zig");
+const tips_view = @import("views/tips.zig");
+const projects_view = @import("views/projects.zig");
 const root_mod = @import("../root.zig");
 
 const log = std.log.scoped(.tui);
@@ -180,8 +182,8 @@ pub const App = struct {
         switch (app.tab) {
             .live => try live_view.draw(frame),
             .sessions => try app.drawSessions(frame),
-            .tips => drawPlaceholder(frame, "Tips arrive in milestone 5"),
-            .projects => drawPlaceholder(frame, "Project audit arrives in milestone 5"),
+            .tips => try tips_view.draw(frame),
+            .projects => try projects_view.draw(frame),
             .stats => try stats_view.draw(frame),
         }
 

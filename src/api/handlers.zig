@@ -6,7 +6,9 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const index_mod = @import("../core/index.zig");
 const digest_mod = @import("../core/digest.zig");
+const tips_mod = @import("../core/tips.zig");
 const broadcast = @import("../infra/broadcast.zig");
+const project_scanner = @import("../infra/project_scanner.zig");
 
 const log = std.log.scoped(.api);
 
@@ -93,6 +95,13 @@ pub const Handlers = struct {
             const markdown = try h.buildDigest(io, arena, range);
             return .{ .body = markdown, .headers = &markdown_headers };
         }
+        if (std.mem.eql(u8, path, "/api/projects")) {
+            const sessions = try h.index.listSessions(io, arena);
+            return .{ .body = try toJson(arena, try project_scanner.scan(arena, io, sessions)) };
+        }
+        if (std.mem.eql(u8, path, "/api/tips")) {
+            return .{ .body = try toJson(arena, try h.buildTips(io, arena)) };
+        }
         const sessions_prefix = "/api/sessions/";
         if (std.mem.startsWith(u8, path, sessions_prefix)) {
             const rest = path[sessions_prefix.len..];
@@ -107,6 +116,13 @@ pub const Handlers = struct {
             return .{ .body = try toJson(arena, detail) };
         }
         return null;
+    }
+
+    pub fn buildTips(h: *Handlers, io: Io, arena: Allocator) Allocator.Error![]tips_mod.Tip {
+        const report = try h.index.statsReport(io, arena, 7, nowMs(io));
+        const sessions = try h.index.listSessions(io, arena);
+        const audits = try project_scanner.scan(arena, io, sessions);
+        return tips_mod.evaluate(arena, .{ .report = report, .sessions = sessions, .audits = audits });
     }
 
     fn buildDigest(h: *Handlers, io: Io, arena: Allocator, range_days: u32) Allocator.Error![]const u8 {

@@ -41,6 +41,8 @@ pub const Session = struct {
     subagent_event_count: u32 = 0,
     unknown_record_count: u32 = 0,
     hook_error_count: u32 = 0,
+    /// Prompts that look like large pastes (code/log dumps) instead of `@file` references.
+    long_prompt_count: u32 = 0,
     tool_counts: std.StringHashMapUnmanaged(u32) = .empty,
     seen_usage_ids: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -104,6 +106,7 @@ pub const Session = struct {
         switch (e.payload) {
             .prompt => |p| {
                 s.prompt_count += 1;
+                if (p.truncated or p.text.len >= 1500) s.long_prompt_count += 1;
                 try replace(gpa, &s.last_prompt, p.text);
                 try replace(gpa, &s.last_activity, "reading your prompt");
             },

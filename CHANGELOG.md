@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `/api/digest?range=Nd`: compact markdown digest (totals, per-day/project
   tables, friction signals, verbatim prompt samples) built for LLM analysis.
 - Stats tab in the TUI with a prompts-per-day sparkline.
+- Tips engine (`/api/tips` + Tips tab): six starter rules — missing CLAUDE.md,
+  permission friction, large prompt pastes, failing hooks, tool error loops,
+  unknown transcript records.
+- Project audit (`/api/projects` + Projects tab): per-project check for
+  CLAUDE.md, `.claude/settings.json` and the local permission allowlist.
 - Built-in TUI (default command): Live tab with per-project session cards and
   a real-time event feed, Sessions tab with a navigable table and a
   full-detail panel (tokens breakdown, tool usage, recent events). Flicker-free
