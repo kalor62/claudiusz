@@ -90,8 +90,7 @@ fn collectSubagents(
     defer gpa.free(rel);
 
     var subagents_dir = project_dir.openDir(io, rel, .{ .iterate = true }) catch |err| {
-        // Most session directories simply have no subagents; anything else is
-        // still non-fatal for discovery.
+        // FileNotFound is the normal no-subagents case; anything else is still non-fatal for discovery.
         if (err != error.FileNotFound) {
             log.debug("cannot open {s}/{s}: {s}", .{ project_path, rel, @errorName(err) });
         }

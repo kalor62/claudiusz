@@ -374,7 +374,7 @@ pub const Index = struct {
         var views: std.ArrayList(EventView) = .empty;
         var taken: usize = 0;
         var i: usize = 0;
-        // Walk newest → oldest, then reverse for chronological output.
+        // Newest-first walk so `limit` keeps the most recent events; reversed below.
         while (i < ix.ring_len and taken < limit) : (i += 1) {
             const slot = (ix.ring_next + ix.ring.len - 1 - i) % ix.ring.len;
             const e = &(ix.ring[slot] orelse continue);
@@ -564,16 +564,14 @@ test "liveness overlay updates status and reports changes" {
     try testing.expectEqualStrings("waiting_for_user", changes[0].status);
     try testing.expectEqualStrings("permission prompt", changes[0].waiting_for);
 
-    // Same state again: no change events.
     const changes_again = try ix.applyLiveness(io, arena, &.{
         .{ .session_id = "s1", .status = .waiting_for_user, .waiting_for = "permission prompt", .pid = 123, .updated_at_ms = 9 },
     });
     try testing.expectEqual(@as(usize, 0), changes_again.len);
 
-    // Process gone: session flips to done.
-    const changes_done = try ix.applyLiveness(io, arena, &.{});
-    try testing.expectEqual(@as(usize, 1), changes_done.len);
-    try testing.expectEqualStrings("done", changes_done[0].status);
+    const changes_after_process_exit = try ix.applyLiveness(io, arena, &.{});
+    try testing.expectEqual(@as(usize, 1), changes_after_process_exit.len);
+    try testing.expectEqualStrings("done", changes_after_process_exit[0].status);
 
     const sessions = try ix.listSessions(io, arena);
     try testing.expectEqualStrings("done", sessions[0].status);

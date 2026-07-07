@@ -183,7 +183,6 @@ test "watcher reports only complete appended lines" {
     try watcher.tick(&handler);
     try testing.expectEqual(@as(usize, 0), handler.lines.items.len);
 
-    // Append one full line and one partial line.
     {
         var file = try tmp.dir.openFile(io, "root/projects/-p/s.jsonl", .{ .mode = .write_only });
         defer file.close(io);
@@ -193,7 +192,6 @@ test "watcher reports only complete appended lines" {
     try testing.expectEqual(@as(usize, 1), handler.lines.items.len);
     try testing.expectEqualStrings("new line", handler.lines.items[0]);
 
-    // Complete the partial line.
     {
         var file = try tmp.dir.openFile(io, "root/projects/-p/s.jsonl", .{ .mode = .write_only });
         defer file.close(io);

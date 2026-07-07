@@ -96,10 +96,8 @@ pub const Session = struct {
         if (e.git_branch.len > 0) try replaceIfChanged(gpa, &s.git_branch, e.git_branch);
         if (e.app_version.len > 0 and s.app_version.len == 0) try replace(gpa, &s.app_version, e.app_version);
         if (e.is_sidechain) {
-            // Subagent traffic must not overwrite the interactive session's
-            // activity picture — but its token usage is real cost, so that
-            // still flows through the deduped accounting below.
             s.subagent_event_count += 1;
+            // Subagent tokens are real cost; everything else would overwrite the session's activity picture.
             if (e.payload != .usage) return .{};
         }
 
