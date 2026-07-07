@@ -7,6 +7,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const event_mod = @import("event.zig");
 const session_mod = @import("session.zig");
+const stats = @import("stats.zig");
 
 const Event = event_mod.Event;
 const Tokens = event_mod.Tokens;
@@ -62,6 +63,7 @@ pub const SessionDetail = struct {
     live_updated_at_ms: i64,
     subagent_event_count: u32,
     unknown_record_count: u32,
+    hook_error_count: u32,
     tool_counts: []ToolCount,
 };
 
@@ -88,6 +90,8 @@ pub const Index = struct {
     ring: []?Event,
     ring_next: usize = 0,
     ring_len: usize = 0,
+    daily: std.AutoHashMapUnmanaged(i32, stats.DayAgg) = .empty,
+    hour_prompts: [24]u32 = @splat(0),
 
     pub fn init(gpa: Allocator, ring_capacity: usize) Allocator.Error!Index {
         const ring = try gpa.alloc(?Event, ring_capacity);
@@ -106,6 +110,7 @@ pub const Index = struct {
             if (slot.*) |*e| e.deinit(ix.gpa);
         }
         ix.gpa.free(ix.ring);
+        ix.daily.deinit(ix.gpa);
         ix.* = undefined;
     }
 
@@ -127,9 +132,138 @@ pub const Index = struct {
                 gop.key_ptr.* = session.id;
                 gop.value_ptr.* = session;
             }
-            try gop.value_ptr.*.applyEvent(ix.gpa, &owned);
+            const result = try gop.value_ptr.*.applyEvent(ix.gpa, &owned);
+            try ix.applyToDaily(&owned, result);
         }
         ix.pushRing(owned);
+    }
+
+    fn applyToDaily(ix: *Index, e: *const Event, result: Session.ApplyResult) Allocator.Error!void {
+        const day = stats.dayKeyFromMs(e.timestamp_ms) orelse return;
+        const gop = try ix.daily.getOrPut(ix.gpa, day);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const agg = gop.value_ptr;
+        if (result.fresh_usage) |tokens| {
+            agg.tokens.input += tokens.input;
+            agg.tokens.output += tokens.output;
+            agg.tokens.cache_read += tokens.cache_read;
+            agg.tokens.cache_creation += tokens.cache_creation;
+        }
+        if (e.is_sidechain) return;
+        switch (e.payload) {
+            .prompt => {
+                agg.prompts += 1;
+                ix.hour_prompts[stats.hourFromMs(e.timestamp_ms)] += 1;
+            },
+            .tool_call => agg.tool_calls += 1,
+            .tool_result => |p| {
+                if (p.ok == false) agg.failures += 1;
+            },
+            else => {},
+        }
+    }
+
+    /// Arena-copied statistics report for the trailing `range_days` window.
+    pub fn statsReport(
+        ix: *Index,
+        io: Io,
+        arena: Allocator,
+        range_days: u32,
+        now_ms: i64,
+    ) Allocator.Error!stats.Report {
+        ix.mutex.lockUncancelable(io);
+        defer ix.mutex.unlock(io);
+
+        const today = stats.dayKeyFromMs(now_ms) orelse 0;
+        const first_day = today - @as(i32, @intCast(range_days)) + 1;
+        const range_start_ms = @as(i64, first_day) * 86_400_000;
+
+        var totals = stats.DayAgg{};
+        var days: std.ArrayList(stats.DayRow) = .empty;
+        var day_it = ix.daily.iterator();
+        while (day_it.next()) |entry| {
+            if (entry.key_ptr.* < first_day) continue;
+            totals.add(entry.value_ptr.*);
+            var date_buf: [10]u8 = undefined;
+            try days.append(arena, .{
+                .date = try arena.dupe(u8, stats.formatDayKey(&date_buf, entry.key_ptr.*)),
+                .day_key = entry.key_ptr.*,
+                .prompts = entry.value_ptr.prompts,
+                .tool_calls = entry.value_ptr.tool_calls,
+                .failures = entry.value_ptr.failures,
+                .tokens = entry.value_ptr.tokens,
+            });
+        }
+        const day_rows = try days.toOwnedSlice(arena);
+        std.sort.pdq(stats.DayRow, day_rows, {}, dayRowLessThan);
+
+        var tools: std.StringHashMapUnmanaged(u32) = .empty;
+        defer tools.deinit(arena);
+        var projects: std.StringHashMapUnmanaged(stats.ProjectRow) = .empty;
+        defer projects.deinit(arena);
+        var session_it = ix.sessions.valueIterator();
+        while (session_it.next()) |session_ptr| {
+            const session = session_ptr.*;
+            if (session.last_ts_ms < range_start_ms) continue;
+            var tool_it = session.tool_counts.iterator();
+            while (tool_it.next()) |entry| {
+                const gop = try tools.getOrPut(arena, entry.key_ptr.*);
+                if (!gop.found_existing) {
+                    gop.key_ptr.* = try arena.dupe(u8, entry.key_ptr.*);
+                    gop.value_ptr.* = 0;
+                }
+                gop.value_ptr.* += entry.value_ptr.*;
+            }
+            const project = projectName(session.cwd);
+            const gop = try projects.getOrPut(arena, project);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try arena.dupe(u8, project);
+                gop.value_ptr.* = .{ .project = gop.key_ptr.* };
+            }
+            const row = gop.value_ptr;
+            row.sessions += 1;
+            row.prompts += session.prompt_count;
+            row.tool_calls += session.tool_call_count;
+            row.failures += session.tool_failure_count;
+            row.hook_errors += session.hook_error_count;
+            row.tokens.input += session.tokens.input;
+            row.tokens.output += session.tokens.output;
+            row.tokens.cache_read += session.tokens.cache_read;
+            row.tokens.cache_creation += session.tokens.cache_creation;
+        }
+
+        var tool_rows = try arena.alloc(ToolCount, tools.count());
+        var tool_it = tools.iterator();
+        var i: usize = 0;
+        while (tool_it.next()) |entry| : (i += 1) {
+            tool_rows[i] = .{ .name = entry.key_ptr.*, .count = entry.value_ptr.* };
+        }
+        std.sort.pdq(ToolCount, tool_rows, {}, toolCountGreaterThan);
+
+        var project_rows = try arena.alloc(stats.ProjectRow, projects.count());
+        var project_it = projects.valueIterator();
+        i = 0;
+        while (project_it.next()) |row| : (i += 1) project_rows[i] = row.*;
+        std.sort.pdq(stats.ProjectRow, project_rows, {}, projectMoreActive);
+
+        return .{
+            .range_days = range_days,
+            .generated_at_ms = now_ms,
+            .totals = totals,
+            .days = day_rows,
+            .top_tools = tool_rows,
+            .top_projects = project_rows,
+            .hour_prompts = ix.hour_prompts,
+        };
+    }
+
+    fn dayRowLessThan(_: void, a: stats.DayRow, b: stats.DayRow) bool {
+        return a.day_key < b.day_key;
+    }
+
+    fn projectMoreActive(_: void, a: stats.ProjectRow, b: stats.ProjectRow) bool {
+        if (a.prompts != b.prompts) return a.prompts > b.prompts;
+        return a.tokens.output > b.tokens.output;
     }
 
     /// Overlays live process state onto sessions. Sessions absent from
@@ -217,6 +351,7 @@ pub const Index = struct {
             .live_updated_at_ms = session.live_updated_at_ms,
             .subagent_event_count = session.subagent_event_count,
             .unknown_record_count = session.unknown_record_count,
+            .hook_error_count = session.hook_error_count,
             .tool_counts = tool_counts,
         };
     }

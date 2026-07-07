@@ -5,12 +5,18 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const index_mod = @import("../core/index.zig");
+const digest_mod = @import("../core/digest.zig");
 const broadcast = @import("../infra/broadcast.zig");
 
 const log = std.log.scoped(.api);
 
 const json_headers = [_]std.http.Header{
     .{ .name = "content-type", .value = "application/json" },
+    .{ .name = "access-control-allow-origin", .value = "*" },
+};
+
+const markdown_headers = [_]std.http.Header{
+    .{ .name = "content-type", .value = "text/markdown; charset=utf-8" },
     .{ .name = "access-control-allow-origin", .value = "*" },
 };
 
@@ -46,7 +52,7 @@ pub const Handlers = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const body = h.routeJson(io, arena, path, query) catch |err| switch (err) {
+        const response = h.route(io, arena, path, query) catch |err| switch (err) {
             error.OutOfMemory => return request.respond("{\"error\":\"out of memory\"}\n", .{
                 .status = .internal_server_error,
                 .extra_headers = &json_headers,
@@ -55,22 +61,37 @@ pub const Handlers = struct {
             .status = .not_found,
             .extra_headers = &json_headers,
         });
-        try request.respond(body, .{ .extra_headers = &json_headers });
+        try request.respond(response.body, .{ .extra_headers = response.headers });
     }
 
-    /// Returns the JSON body for `path`, or null for "no such route".
-    fn routeJson(
+    const Response = struct {
+        body: []const u8,
+        headers: []const std.http.Header = &json_headers,
+    };
+
+    /// Builds the response for `path`, or null for "no such route".
+    fn route(
         h: *Handlers,
         io: Io,
         arena: Allocator,
         path: []const u8,
         query: []const u8,
-    ) Allocator.Error!?[]const u8 {
+    ) Allocator.Error!?Response {
         if (std.mem.eql(u8, path, "/api/health")) {
-            return try toJson(arena, .{ .status = "ok", .version = h.version });
+            return .{ .body = try toJson(arena, .{ .status = "ok", .version = h.version }) };
         }
         if (std.mem.eql(u8, path, "/api/sessions")) {
-            return try toJson(arena, try h.index.listSessions(io, arena));
+            return .{ .body = try toJson(arena, try h.index.listSessions(io, arena)) };
+        }
+        if (std.mem.eql(u8, path, "/api/stats")) {
+            const range = queryRangeDays(query) orelse 7;
+            const report = try h.index.statsReport(io, arena, range, nowMs(io));
+            return .{ .body = try toJson(arena, report) };
+        }
+        if (std.mem.eql(u8, path, "/api/digest")) {
+            const range = queryRangeDays(query) orelse 7;
+            const markdown = try h.buildDigest(io, arena, range);
+            return .{ .body = markdown, .headers = &markdown_headers };
         }
         const sessions_prefix = "/api/sessions/";
         if (std.mem.startsWith(u8, path, sessions_prefix)) {
@@ -79,13 +100,30 @@ pub const Handlers = struct {
                 const id = rest[0 .. rest.len - "/tail".len];
                 if (id.len == 0) return null;
                 const limit = queryUint(query, "n") orelse 50;
-                return try toJson(arena, try h.index.tailEvents(io, arena, id, @min(limit, 1000)));
+                return .{ .body = try toJson(arena, try h.index.tailEvents(io, arena, id, @min(limit, 1000))) };
             }
             if (rest.len == 0 or std.mem.indexOfScalar(u8, rest, '/') != null) return null;
             const detail = (try h.index.sessionDetail(io, arena, rest)) orelse return null;
-            return try toJson(arena, detail);
+            return .{ .body = try toJson(arena, detail) };
         }
         return null;
+    }
+
+    fn buildDigest(h: *Handlers, io: Io, arena: Allocator, range_days: u32) Allocator.Error![]const u8 {
+        const report = try h.index.statsReport(io, arena, range_days, nowMs(io));
+        const sessions = try h.index.listSessions(io, arena);
+        const recent = try h.index.tailEvents(io, arena, null, 4000);
+        var samples: std.ArrayList([]const u8) = .empty;
+        for (recent) |e| {
+            if (e.is_sidechain or !std.mem.eql(u8, e.kind, "prompt")) continue;
+            try samples.append(arena, e.text);
+        }
+        return digest_mod.build(arena, .{
+            .report = report,
+            .sessions = sessions,
+            .prompt_samples = samples.items,
+            .tool_version = h.version,
+        });
     }
 
     fn serveStream(h: *Handlers, io: Io, request: *std.http.Server.Request) !void {
@@ -137,6 +175,25 @@ fn queryUint(query: []const u8, name: []const u8) ?usize {
     return null;
 }
 
+/// Accepts `range=7d` or `range=7`; clamps to [1, 365].
+fn queryRangeDays(query: []const u8) ?u32 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (!std.mem.eql(u8, pair[0..eq], "range")) continue;
+        var value = pair[eq + 1 ..];
+        if (std.mem.endsWith(u8, value, "d")) value = value[0 .. value.len - 1];
+        const days = std.fmt.parseInt(u32, value, 10) catch return null;
+        return std.math.clamp(days, 1, 365);
+    }
+    return null;
+}
+
+fn nowMs(io: Io) i64 {
+    const ts = Io.Timestamp.now(io, .real);
+    return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
+}
+
 // --- tests ---------------------------------------------------------------
 
 const testing = std.testing;
@@ -147,7 +204,7 @@ test "queryUint extracts numeric parameters" {
     try testing.expectEqual(@as(?usize, null), queryUint("", "n"));
 }
 
-test "routeJson serves sessions, detail, tail and 404" {
+test "route serves sessions, detail, tail and 404" {
     const io = testing.io;
     var ix = try index_mod.Index.init(testing.allocator, 8);
     defer ix.deinit();
@@ -172,18 +229,18 @@ test "routeJson serves sessions, detail, tail and 404" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const sessions_json = (try handlers.routeJson(io, arena, "/api/sessions", "")).?;
+    const sessions_json = (try handlers.route(io, arena, "/api/sessions", "")).?.body;
     try testing.expect(std.mem.indexOf(u8, sessions_json, "\"id\":\"s1\"") != null);
     try testing.expect(std.mem.indexOf(u8, sessions_json, "\"project\":\"alpha\"") != null);
 
-    const detail_json = (try handlers.routeJson(io, arena, "/api/sessions/s1", "")).?;
+    const detail_json = (try handlers.route(io, arena, "/api/sessions/s1", "")).?.body;
     try testing.expect(std.mem.indexOf(u8, detail_json, "\"permission_mode\"") != null);
 
-    const tail_json = (try handlers.routeJson(io, arena, "/api/sessions/s1/tail", "n=10")).?;
+    const tail_json = (try handlers.route(io, arena, "/api/sessions/s1/tail", "n=10")).?.body;
     try testing.expect(std.mem.indexOf(u8, tail_json, "\"kind\":\"prompt\"") != null);
     try testing.expect(std.mem.indexOf(u8, tail_json, "hello api") != null);
 
-    try testing.expectEqual(@as(?[]const u8, null), try handlers.routeJson(io, arena, "/api/sessions/nope", ""));
-    try testing.expectEqual(@as(?[]const u8, null), try handlers.routeJson(io, arena, "/api/bogus", ""));
-    try testing.expect((try handlers.routeJson(io, arena, "/api/health", "")) != null);
+    try testing.expect((try handlers.route(io, arena, "/api/sessions/nope", "")) == null);
+    try testing.expect((try handlers.route(io, arena, "/api/bogus", "")) == null);
+    try testing.expect((try handlers.route(io, arena, "/api/health", "")) != null);
 }

@@ -40,6 +40,7 @@ pub const Session = struct {
     tool_failure_count: u32 = 0,
     subagent_event_count: u32 = 0,
     unknown_record_count: u32 = 0,
+    hook_error_count: u32 = 0,
     tool_counts: std.StringHashMapUnmanaged(u32) = .empty,
     seen_usage_ids: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -77,8 +78,14 @@ pub const Session = struct {
         s.* = undefined;
     }
 
+    /// What one event contributed, for index-level (daily) aggregation.
+    pub const ApplyResult = struct {
+        /// Set when this event added not-yet-counted token usage.
+        fresh_usage: ?Tokens = null,
+    };
+
     /// Folds one event into the aggregate. The event is only read.
-    pub fn applyEvent(s: *Session, gpa: Allocator, e: *const Event) Allocator.Error!void {
+    pub fn applyEvent(s: *Session, gpa: Allocator, e: *const Event) Allocator.Error!ApplyResult {
         if (e.timestamp_ms > 0) {
             if (s.first_ts_ms == 0 or e.timestamp_ms < s.first_ts_ms) s.first_ts_ms = e.timestamp_ms;
             if (e.timestamp_ms > s.last_ts_ms) s.last_ts_ms = e.timestamp_ms;
@@ -87,9 +94,11 @@ pub const Session = struct {
         if (e.git_branch.len > 0) try replaceIfChanged(gpa, &s.git_branch, e.git_branch);
         if (e.app_version.len > 0 and s.app_version.len == 0) try replace(gpa, &s.app_version, e.app_version);
         if (e.is_sidechain) {
-            // Subagent traffic must not overwrite the interactive session's activity picture.
+            // Subagent traffic must not overwrite the interactive session's
+            // activity picture — but its token usage is real cost, so that
+            // still flows through the deduped accounting below.
             s.subagent_event_count += 1;
-            return;
+            if (e.payload != .usage) return .{};
         }
 
         switch (e.payload) {
@@ -111,24 +120,29 @@ pub const Session = struct {
             },
             .usage => |p| {
                 if (p.model.len > 0) try replaceIfChanged(gpa, &s.model, p.model);
-                if (p.message_id.len == 0) return;
+                if (p.message_id.len == 0) return .{};
                 const gop = try s.seen_usage_ids.getOrPut(gpa, p.message_id);
-                if (gop.found_existing) return;
+                if (gop.found_existing) return .{};
                 gop.key_ptr.* = try gpa.dupe(u8, p.message_id);
                 s.tokens.input += p.tokens.input;
                 s.tokens.output += p.tokens.output;
                 s.tokens.cache_read += p.tokens.cache_read;
                 s.tokens.cache_creation += p.tokens.cache_creation;
+                return .{ .fresh_usage = p.tokens };
             },
             .meta => |p| switch (p.kind) {
                 .title => try replace(gpa, &s.title, p.value),
                 .permission_mode => try replace(gpa, &s.permission_mode, p.value),
                 .agent_name => try replace(gpa, &s.agent_name, p.value),
-                .mode, .attachment => {},
+                .attachment => {
+                    if (std.mem.startsWith(u8, p.value, "hook_non_blocking_error")) s.hook_error_count += 1;
+                },
+                .mode => {},
             },
             .system => {},
             .unknown => s.unknown_record_count += 1,
         }
+        return .{};
     }
 
     fn replace(gpa: Allocator, slot: *[]const u8, value: []const u8) Allocator.Error!void {
@@ -181,7 +195,7 @@ test "session aggregates prompts, tools and deduped usage" {
     for (lines) |line| {
         const events = try parser.parseLine(gpa, line);
         defer event_mod.freeEvents(gpa, events);
-        for (events) |*e| try session.applyEvent(gpa, e);
+        for (events) |*e| _ = try session.applyEvent(gpa, e);
     }
 
     try testing.expectEqual(@as(u32, 1), session.prompt_count);
@@ -211,7 +225,7 @@ test "sidechain events count separately and keep main activity" {
     for ([_][]const u8{ main_line, side_line }) |line| {
         const events = try parser.parseLine(gpa, line);
         defer event_mod.freeEvents(gpa, events);
-        for (events) |*e| try session.applyEvent(gpa, e);
+        for (events) |*e| _ = try session.applyEvent(gpa, e);
     }
 
     try testing.expectEqual(@as(u32, 1), session.subagent_event_count);

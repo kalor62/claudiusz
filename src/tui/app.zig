@@ -12,6 +12,7 @@ const render = @import("render.zig");
 const widgets = @import("widgets.zig");
 const live_view = @import("views/live.zig");
 const sessions_view = @import("views/sessions.zig");
+const stats_view = @import("views/stats.zig");
 const root_mod = @import("../root.zig");
 
 const log = std.log.scoped(.tui);
@@ -181,7 +182,7 @@ pub const App = struct {
             .sessions => try app.drawSessions(frame),
             .tips => drawPlaceholder(frame, "Tips arrive in milestone 5"),
             .projects => drawPlaceholder(frame, "Project audit arrives in milestone 5"),
-            .stats => drawPlaceholder(frame, "Stats arrive in milestone 4"),
+            .stats => try stats_view.draw(frame),
         }
 
         app.term.writeOut(try app.screen.renderDiff());

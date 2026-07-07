@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Endpoints: `/api/health`, `/api/sessions`, `/api/sessions/:id`,
   `/api/sessions/:id/tail?n=`, and `/api/stream` (SSE live feed with
   `session_status` change events).
+- Daily usage aggregation and `/api/stats?range=Nd`: totals, per-day rows,
+  top tools, top projects, hour histogram.
+- `/api/digest?range=Nd`: compact markdown digest (totals, per-day/project
+  tables, friction signals, verbatim prompt samples) built for LLM analysis.
+- Stats tab in the TUI with a prompts-per-day sparkline.
 - Built-in TUI (default command): Live tab with per-project session cards and
   a real-time event feed, Sessions tab with a navigable table and a
   full-detail panel (tokens breakdown, tool usage, recent events). Flicker-free
