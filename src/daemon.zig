@@ -145,7 +145,7 @@ pub const Daemon = struct {
         d.broadcaster.publish(d.io, frame);
     }
 
-    fn nowMs(d: *Daemon) i64 {
+    pub fn nowMs(d: *Daemon) i64 {
         const ts = Io.Timestamp.now(d.io, .real);
         return @intCast(@divTrunc(ts.nanoseconds, std.time.ns_per_ms));
     }

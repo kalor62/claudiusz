@@ -33,10 +33,7 @@ pub fn main(init: std.process.Init) !void {
     switch (options.command) {
         .tail => try runTail(init.gpa, io, cfg, options.from_start),
         .serve => try runServe(init.gpa, io, cfg),
-        .tui => {
-            printToStderr(io, "error: the TUI is not implemented yet; try `claudiusz serve` or `claudiusz tail`\n");
-            std.process.exit(1);
-        },
+        .tui => try runTui(init.gpa, io, cfg),
     }
 }
 
@@ -49,6 +46,32 @@ fn runServe(gpa: std.mem.Allocator, io: Io, cfg: claudiusz.config.Config) !void 
     const collector = try daemon.startCollector();
     collector.detach();
     try daemon.serveHttp();
+}
+
+fn runTui(gpa: std.mem.Allocator, io: Io, cfg: claudiusz.config.Config) !void {
+    if (@import("builtin").os.tag == .windows) {
+        printToStderr(io, "error: the TUI needs a POSIX terminal; on Windows use `claudiusz serve` with an external frontend\n");
+        std.process.exit(1);
+    }
+    const daemon = try gpa.create(claudiusz.daemon.Daemon);
+    defer gpa.destroy(daemon);
+    try daemon.init(gpa, io, cfg);
+    defer daemon.deinit();
+
+    const collector = try daemon.startCollector();
+    collector.detach();
+    const http_thread = try std.Thread.spawn(.{}, serveHttpLogged, .{daemon});
+    http_thread.detach();
+
+    var app = try claudiusz.tui.app.App.init(gpa, daemon);
+    defer app.deinit();
+    try app.run();
+}
+
+fn serveHttpLogged(daemon: *claudiusz.daemon.Daemon) void {
+    daemon.serveHttp() catch |err| {
+        log.err("HTTP API stopped: {s}", .{@errorName(err)});
+    };
 }
 
 fn runTail(gpa: std.mem.Allocator, io: Io, cfg: claudiusz.config.Config, from_start: bool) !void {

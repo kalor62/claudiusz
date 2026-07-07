@@ -22,3 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Endpoints: `/api/health`, `/api/sessions`, `/api/sessions/:id`,
   `/api/sessions/:id/tail?n=`, and `/api/stream` (SSE live feed with
   `session_status` change events).
+- Built-in TUI (default command): Live tab with per-project session cards and
+  a real-time event feed, Sessions tab with a navigable table and a
+  full-detail panel (tokens breakdown, tool usage, recent events). Flicker-free
+  diff renderer, 256-color, resize-aware. POSIX terminals only.

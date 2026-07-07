@@ -21,6 +21,11 @@ pub const liveness = @import("infra/liveness.zig");
 pub const broadcast = @import("infra/broadcast.zig");
 pub const http = @import("infra/http.zig");
 pub const Watcher = @import("infra/watcher.zig").Watcher;
+pub const tui = if (@import("builtin").os.tag == .windows) struct {} else struct {
+    pub const app = @import("tui/app.zig");
+    pub const render = @import("tui/render.zig");
+    pub const widgets = @import("tui/widgets.zig");
+};
 
 test {
     std.testing.refAllDecls(@This());
