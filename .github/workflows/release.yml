@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        target:
+          - aarch64-macos
+          - x86_64-macos
+          - aarch64-linux
+          - x86_64-linux
+          - aarch64-windows
+          - x86_64-windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+      - name: Package
+        run: |
+          name=claudiusz-${{ github.ref_name }}-${{ matrix.target }}
+          mkdir "$name"
+          cp zig-out/bin/claudiusz* "$name"/
+          cp LICENSE README.md "$name"/
+          tar czf "$name.tar.gz" "$name"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: claudiusz-*.tar.gz
