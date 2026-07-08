@@ -11,6 +11,7 @@ const event_mod = @import("core/event.zig");
 const parser = @import("core/parser.zig");
 const index_mod = @import("core/index.zig");
 const watcher_mod = @import("infra/watcher.zig");
+const snapshot = @import("infra/snapshot.zig");
 const liveness = @import("infra/liveness.zig");
 const broadcast = @import("infra/broadcast.zig");
 const http = @import("infra/http.zig");
@@ -23,6 +24,7 @@ const log = std.log.scoped(.daemon);
 pub const ring_capacity = 8192;
 const liveness_every_ticks = 3;
 const heartbeat_every_ticks = 50;
+const snapshot_save_interval_ms: i64 = 60_000;
 
 pub const Daemon = struct {
     gpa: Allocator,
@@ -78,6 +80,9 @@ pub const Daemon = struct {
         defer watcher.deinit();
         var sink = Sink{ .daemon = d };
 
+        if (d.cfg.cache_path) |path| {
+            _ = snapshot.load(d.gpa, d.io, path, &d.index, &watcher);
+        }
         watcher.tick(&sink) catch |err| {
             log.err("history backfill failed: {s}", .{@errorName(err)});
         };
@@ -86,6 +91,10 @@ pub const Daemon = struct {
         d.livenessPass();
         log.info("backfill complete, watching {s}", .{d.cfg.root});
 
+        d.saveSnapshot(&watcher);
+        var saved_lines = sink.lines_seen;
+        var saved_at_ms = d.nowMs();
+
         var ticks: u64 = 0;
         while (d.running.load(.acquire)) : (ticks += 1) {
             watcher.tick(&sink) catch |err| {
@@ -93,11 +102,22 @@ pub const Daemon = struct {
             };
             if (ticks % liveness_every_ticks == 0) d.livenessPass();
             if (ticks % heartbeat_every_ticks == 0) d.broadcaster.publish(d.io, ": ping\n\n");
+            if (sink.lines_seen != saved_lines and d.nowMs() - saved_at_ms >= snapshot_save_interval_ms) {
+                d.saveSnapshot(&watcher);
+                saved_lines = sink.lines_seen;
+                saved_at_ms = d.nowMs();
+            }
             d.io.sleep(.fromMilliseconds(@intCast(d.cfg.poll_interval_ms)), .awake) catch |err| {
                 log.warn("collector sleep interrupted: {s}", .{@errorName(err)});
                 return;
             };
         }
+        if (sink.lines_seen != saved_lines) d.saveSnapshot(&watcher);
+    }
+
+    fn saveSnapshot(d: *Daemon, watcher: *const watcher_mod.Watcher) void {
+        const path = d.cfg.cache_path orelse return;
+        snapshot.save(d.gpa, d.io, path, &d.index, watcher);
     }
 
     /// Asks the collector loop to exit; join the thread returned by
@@ -170,9 +190,12 @@ fn sseEventName(e: *const event_mod.Event) []const u8 {
 const Sink = struct {
     daemon: *Daemon,
     publish: bool = false,
+    /// Total lines applied; the snapshot writer's dirty marker.
+    lines_seen: u64 = 0,
 
     pub fn onLine(s: *Sink, path: []const u8, line: []const u8) void {
         _ = path;
+        s.lines_seen += 1;
         const d = s.daemon;
         const events = parser.parseLine(d.gpa, line) catch |err| {
             log.warn("parse failed: {s}", .{@errorName(err)});

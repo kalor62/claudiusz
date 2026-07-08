@@ -96,6 +96,47 @@ pub const EventView = struct {
     tokens: ?Tokens = null,
 };
 
+/// Persistable aggregate of one session; the snapshot wire shape.
+pub const SessionExport = struct {
+    id: []const u8,
+    cwd: []const u8 = "",
+    title: []const u8 = "",
+    agent_name: []const u8 = "",
+    model: []const u8 = "",
+    permission_mode: []const u8 = "",
+    git_branch: []const u8 = "",
+    app_version: []const u8 = "",
+    last_prompt: []const u8 = "",
+    last_activity: []const u8 = "",
+    tokens: Tokens = .{},
+    prompt_count: u32 = 0,
+    tool_call_count: u32 = 0,
+    tool_failure_count: u32 = 0,
+    subagent_event_count: u32 = 0,
+    unknown_record_count: u32 = 0,
+    hook_error_count: u32 = 0,
+    long_prompt_count: u32 = 0,
+    first_ts_ms: i64 = 0,
+    last_ts_ms: i64 = 0,
+    tool_counts: []ToolCount = &.{},
+    recent_usage_ids: []const []const u8 = &.{},
+};
+
+pub const DailyExport = struct {
+    day_key: i32,
+    prompts: u32 = 0,
+    tool_calls: u32 = 0,
+    failures: u32 = 0,
+    tokens: Tokens = .{},
+};
+
+/// Everything the index knows, in snapshot-serializable form.
+pub const State = struct {
+    sessions: []SessionExport = &.{},
+    daily: []DailyExport = &.{},
+    hour_prompts: [24]u32 = @splat(0),
+};
+
 pub const Index = struct {
     gpa: Allocator,
     mutex: Io.Mutex = .init,
@@ -125,6 +166,145 @@ pub const Index = struct {
         ix.gpa.free(ix.ring);
         ix.daily.deinit(ix.gpa);
         ix.* = undefined;
+    }
+
+    /// Arena-copied snapshot of all aggregates, for persistence.
+    pub fn exportState(ix: *Index, io: Io, arena: Allocator) Allocator.Error!State {
+        ix.mutex.lockUncancelable(io);
+        defer ix.mutex.unlock(io);
+
+        var sessions = try arena.alloc(SessionExport, ix.sessions.count());
+        var it = ix.sessions.valueIterator();
+        var i: usize = 0;
+        while (it.next()) |session_ptr| : (i += 1) {
+            const s = session_ptr.*;
+            var tool_counts = try arena.alloc(ToolCount, s.tool_counts.count());
+            var tool_it = s.tool_counts.iterator();
+            var t: usize = 0;
+            while (tool_it.next()) |entry| : (t += 1) {
+                tool_counts[t] = .{ .name = try arena.dupe(u8, entry.key_ptr.*), .count = entry.value_ptr.* };
+            }
+            var id_buf: [session_mod.recent_usage_capacity][]const u8 = undefined;
+            const recent = s.copyRecentUsageIds(&id_buf);
+            const ids = try arena.alloc([]const u8, recent.len);
+            for (recent, 0..) |id, n| ids[n] = try arena.dupe(u8, id);
+            sessions[i] = .{
+                .id = try arena.dupe(u8, s.id),
+                .cwd = try arena.dupe(u8, s.cwd),
+                .title = try arena.dupe(u8, s.title),
+                .agent_name = try arena.dupe(u8, s.agent_name),
+                .model = try arena.dupe(u8, s.model),
+                .permission_mode = try arena.dupe(u8, s.permission_mode),
+                .git_branch = try arena.dupe(u8, s.git_branch),
+                .app_version = try arena.dupe(u8, s.app_version),
+                .last_prompt = try arena.dupe(u8, s.last_prompt),
+                .last_activity = try arena.dupe(u8, s.last_activity),
+                .tokens = s.tokens,
+                .prompt_count = s.prompt_count,
+                .tool_call_count = s.tool_call_count,
+                .tool_failure_count = s.tool_failure_count,
+                .subagent_event_count = s.subagent_event_count,
+                .unknown_record_count = s.unknown_record_count,
+                .hook_error_count = s.hook_error_count,
+                .long_prompt_count = s.long_prompt_count,
+                .first_ts_ms = s.first_ts_ms,
+                .last_ts_ms = s.last_ts_ms,
+                .tool_counts = tool_counts,
+                .recent_usage_ids = ids,
+            };
+        }
+
+        var daily = try arena.alloc(DailyExport, ix.daily.count());
+        var day_it = ix.daily.iterator();
+        i = 0;
+        while (day_it.next()) |entry| : (i += 1) {
+            daily[i] = .{
+                .day_key = entry.key_ptr.*,
+                .prompts = entry.value_ptr.prompts,
+                .tool_calls = entry.value_ptr.tool_calls,
+                .failures = entry.value_ptr.failures,
+                .tokens = entry.value_ptr.tokens,
+            };
+        }
+        return .{ .sessions = sessions, .daily = daily, .hour_prompts = ix.hour_prompts };
+    }
+
+    /// Rebuilds aggregates from a snapshot. Intended for a fresh index before
+    /// any transcript replay; sessions already present are left untouched.
+    pub fn importState(ix: *Index, io: Io, state: State) Allocator.Error!void {
+        ix.mutex.lockUncancelable(io);
+        defer ix.mutex.unlock(io);
+
+        for (state.sessions) |snap| {
+            if (snap.id.len == 0 or ix.sessions.contains(snap.id)) continue;
+            const created = try ix.gpa.create(Session);
+            errdefer ix.gpa.destroy(created);
+            created.* = try Session.init(ix.gpa, snap.id);
+            errdefer created.deinit(ix.gpa);
+            try fillSession(ix.gpa, created, snap);
+            try ix.sessions.put(ix.gpa, created.id, created);
+        }
+        for (state.daily) |day| {
+            const gop = try ix.daily.getOrPut(ix.gpa, day.day_key);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            gop.value_ptr.add(.{
+                .prompts = day.prompts,
+                .tool_calls = day.tool_calls,
+                .failures = day.failures,
+                .tokens = day.tokens,
+            });
+        }
+        for (&ix.hour_prompts, state.hour_prompts) |*slot, restored| slot.* += restored;
+    }
+
+    fn fillSession(gpa: Allocator, s: *Session, snap: SessionExport) Allocator.Error!void {
+        s.cwd = try gpa.dupe(u8, snap.cwd);
+        s.title = try gpa.dupe(u8, snap.title);
+        s.agent_name = try gpa.dupe(u8, snap.agent_name);
+        s.model = try gpa.dupe(u8, snap.model);
+        s.permission_mode = try gpa.dupe(u8, snap.permission_mode);
+        s.git_branch = try gpa.dupe(u8, snap.git_branch);
+        s.app_version = try gpa.dupe(u8, snap.app_version);
+        s.last_prompt = try gpa.dupe(u8, snap.last_prompt);
+        s.last_activity = try gpa.dupe(u8, snap.last_activity);
+        s.tokens = snap.tokens;
+        s.prompt_count = snap.prompt_count;
+        s.tool_call_count = snap.tool_call_count;
+        s.tool_failure_count = snap.tool_failure_count;
+        s.subagent_event_count = snap.subagent_event_count;
+        s.unknown_record_count = snap.unknown_record_count;
+        s.hook_error_count = snap.hook_error_count;
+        s.long_prompt_count = snap.long_prompt_count;
+        s.first_ts_ms = snap.first_ts_ms;
+        s.last_ts_ms = snap.last_ts_ms;
+        for (snap.tool_counts) |tc| {
+            const key = try gpa.dupe(u8, tc.name);
+            errdefer gpa.free(key);
+            try s.tool_counts.put(gpa, key, tc.count);
+        }
+        for (snap.recent_usage_ids) |id| try s.seedUsageId(gpa, id);
+    }
+
+    /// Drops every aggregate and ring entry, returning the index to its
+    /// just-initialized state. Used when a snapshot import must be undone.
+    pub fn reset(ix: *Index, io: Io) void {
+        ix.mutex.lockUncancelable(io);
+        defer ix.mutex.unlock(io);
+
+        var it = ix.sessions.valueIterator();
+        while (it.next()) |session_ptr| {
+            session_ptr.*.deinit(ix.gpa);
+            ix.gpa.destroy(session_ptr.*);
+        }
+        ix.sessions.clearRetainingCapacity();
+        for (ix.ring) |*slot| {
+            if (slot.*) |*e| e.deinit(ix.gpa);
+            slot.* = null;
+        }
+        ix.ring_next = 0;
+        ix.ring_len = 0;
+        ix.daily.clearRetainingCapacity();
+        ix.hour_prompts = @splat(0);
     }
 
     /// Folds the event into its session aggregate and stores it in the ring.

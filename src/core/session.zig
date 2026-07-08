@@ -14,6 +14,11 @@ pub const ActivityKind = enum(u8) { prompt, responded, tool, subagent };
 
 pub const activity_capacity = 48;
 
+/// How many recent usage message-ids survive a snapshot round trip. Streamed
+/// duplicates of one message appear in adjacent transcript lines, so only ids
+/// near the resume boundary need dedup protection after a restart.
+pub const recent_usage_capacity = 128;
+
 pub const ActivityEntry = struct {
     ts_ms: i64 = 0,
     kind: ActivityKind = .prompt,
@@ -71,6 +76,10 @@ pub const Session = struct {
     long_prompt_count: u32 = 0,
     tool_counts: std.StringHashMapUnmanaged(u32) = .empty,
     seen_usage_ids: std.StringHashMapUnmanaged(void) = .empty,
+    /// Insertion-ordered ring over `seen_usage_ids` keys (borrowed slices).
+    recent_usage: [recent_usage_capacity][]const u8 = undefined,
+    recent_usage_next: usize = 0,
+    recent_usage_len: usize = 0,
 
     first_ts_ms: i64 = 0,
     last_ts_ms: i64 = 0,
@@ -169,6 +178,7 @@ pub const Session = struct {
                 const key = try gpa.dupe(u8, p.message_id);
                 errdefer gpa.free(key);
                 try s.seen_usage_ids.put(gpa, key, {});
+                s.rememberUsageId(key);
                 s.tokens.input += p.tokens.input;
                 s.tokens.output += p.tokens.output;
                 s.tokens.cache_read += p.tokens.cache_read;
@@ -188,6 +198,32 @@ pub const Session = struct {
             .unknown => s.unknown_record_count += 1,
         }
         return .{};
+    }
+
+    fn rememberUsageId(s: *Session, key: []const u8) void {
+        s.recent_usage[s.recent_usage_next] = key;
+        s.recent_usage_next = (s.recent_usage_next + 1) % recent_usage_capacity;
+        if (s.recent_usage_len < recent_usage_capacity) s.recent_usage_len += 1;
+    }
+
+    /// Registers an already-counted usage id without touching token totals
+    /// (snapshot restore path).
+    pub fn seedUsageId(s: *Session, gpa: Allocator, id: []const u8) Allocator.Error!void {
+        if (s.seen_usage_ids.contains(id)) return;
+        const key = try gpa.dupe(u8, id);
+        errdefer gpa.free(key);
+        try s.seen_usage_ids.put(gpa, key, {});
+        s.rememberUsageId(key);
+    }
+
+    /// Copies the recent usage ids oldest-first into `out`; returns the used slice.
+    pub fn copyRecentUsageIds(s: *const Session, out: [][]const u8) [][]const u8 {
+        const count = @min(s.recent_usage_len, out.len);
+        const start = (s.recent_usage_next + recent_usage_capacity - s.recent_usage_len) % recent_usage_capacity;
+        for (0..count) |i| {
+            out[i] = s.recent_usage[(start + i) % recent_usage_capacity];
+        }
+        return out[0..count];
     }
 
     /// Consecutive repeats (same tool, streamed responses, subagent bursts)

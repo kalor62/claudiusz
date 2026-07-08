@@ -11,6 +11,8 @@ pub const Options = struct {
     port: u16 = 8899,
     /// Replay full history instead of starting at end of files (tail only).
     from_start: bool = false,
+    /// Skip the index snapshot cache; always rebuild from transcripts.
+    no_cache: bool = false,
     show_help: bool = false,
     show_version: bool = false,
 };
@@ -33,6 +35,8 @@ pub const usage =
     \\                  Run one instance per root for isolated stats.
     \\  --port <port>   HTTP API port (default: 8899)
     \\  --from-start    tail: replay existing transcripts before following
+    \\  --no-cache      Rebuild the index from transcripts, ignoring the
+    \\                  startup snapshot cache
     \\  -h, --help      Show this help
     \\  -V, --version   Show version
     \\
@@ -57,6 +61,8 @@ pub fn parse(args: []const [:0]const u8) Error!Options {
             options.port = std.fmt.parseInt(u16, value, 10) catch return error.InvalidArguments;
         } else if (std.mem.eql(u8, arg, "--from-start")) {
             options.from_start = true;
+        } else if (std.mem.eql(u8, arg, "--no-cache")) {
+            options.no_cache = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return error.InvalidArguments;
         } else if (!command_seen) {

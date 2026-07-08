@@ -1,301 +1,213 @@
-//! Live view: the mission-control dashboard. Active sessions get large
-//! panels — current activity, last prompt, grouped recent work, token
-//! stats — instead of a raw event stream. Idle sessions collapse to one
-//! line each; a strip of today's totals sits on top.
+//! Live view: a fixed 2×2 grid of session boxes, each exactly a quarter of
+//! the screen. A box shows only the vital numbers of one active session —
+//! tokens, estimated cost, prompts, session length — plus the project's
+//! Claude configuration (quality score, skills, agents, MCP, plugins).
+//! More than four active sessions paginate; digits 1-9 jump between pages.
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const app_mod = @import("../app.zig");
 const widgets = @import("../widgets.zig");
 const render = @import("../render.zig");
 const index_mod = @import("../../core/index.zig");
-const stats_mod = @import("../../core/stats.zig");
+const audit_mod = @import("../../core/audit.zig");
+const pricing = @import("../../core/pricing.zig");
 
 const Frame = app_mod.Frame;
 const theme = widgets.theme;
 
-const max_active_panels = 3;
-const max_idle_rows = 5;
+pub const page_size = 4;
 
-pub fn draw(frame: Frame) Allocator.Error!void {
+/// Pages needed for the sessions that still have a live process behind them.
+pub fn pageCount(sessions: []const index_mod.SessionSummary) usize {
+    var active: usize = 0;
+    for (sessions) |s| {
+        if (s.status != .done) active += 1;
+    }
+    return (active + page_size - 1) / page_size;
+}
+
+pub fn draw(frame: Frame) void {
     const area = frame.area;
-    var y = area.y;
-    y += drawTodayStrip(frame, y);
-
-    var active_buf: [max_active_panels]index_mod.SessionSummary = undefined;
-    var active_len: usize = 0;
-    var active_total: usize = 0;
-    var idle_buf: [max_idle_rows]index_mod.SessionSummary = undefined;
-    var idle_len: usize = 0;
-    var idle_total: usize = 0;
-    for (frame.sessions) |s| switch (s.status) {
-        .working, .waiting_for_user => {
-            active_total += 1;
-            if (active_len < max_active_panels) {
-                active_buf[active_len] = s;
-                active_len += 1;
-            }
-        },
-        .idle => {
-            idle_total += 1;
-            if (idle_len < max_idle_rows) {
-                idle_buf[idle_len] = s;
-                idle_len += 1;
-            }
-        },
-        .done => {},
-    };
-
-    if (active_len == 0 and idle_len == 0) {
+    const pages = pageCount(frame.sessions);
+    if (pages == 0) {
         drawEmptyState(frame);
         return;
     }
+    const page = @min(frame.live_page, pages - 1);
 
-    const bottom = area.y + area.height;
-    var idle_rows: u16 = 0;
-    if (idle_len > 0) idle_rows = @intCast(idle_len + 1);
-    const panel_space = bottom - y - idle_rows;
-
-    if (active_len > 0 and panel_space >= 7) {
-        const panel_height = @max(7, panel_space / @as(u16, @intCast(active_len)));
-        for (active_buf[0..active_len], 0..) |s, i| {
-            const top = y + panel_height * @as(u16, @intCast(i));
-            if (top + 7 > bottom - idle_rows) break;
-            const height = if (i == active_len - 1) panel_space - panel_height * @as(u16, @intCast(i)) else panel_height;
-            try drawActivePanel(frame, .{ .x = area.x, .y = top, .width = area.width, .height = height }, s);
+    var cells: [page_size]?index_mod.SessionSummary = @splat(null);
+    var total_active: usize = 0;
+    const start = page * page_size;
+    for (frame.sessions) |s| {
+        if (s.status == .done) continue;
+        if (total_active >= start and total_active < start + page_size) {
+            cells[total_active - start] = s;
         }
-        if (active_total > active_len) {
-            var buf: [40]u8 = undefined;
-            const note = std.fmt.bufPrint(&buf, "… +{d} more active", .{active_total - active_len}) catch "";
-            _ = frame.screen.writeText(area.x + 2, y + panel_space - 1, note, theme.faint, area.width);
-        }
-    } else if (active_len == 0 and panel_space > 3) {
-        const message = "no session is working right now";
-        _ = frame.screen.writeText(area.x + 2, y + panel_space / 2, message, theme.faint, area.width - 2);
+        total_active += 1;
     }
 
-    if (idle_len > 0) {
-        drawIdleStrip(frame, bottom - idle_rows, idle_buf[0..idle_len], idle_total);
+    const cell_w = area.width / 2;
+    const cell_h = area.height / 2;
+    for (cells, 0..) |cell, i| {
+        const col: u16 = @intCast(i % 2);
+        const row: u16 = @intCast(i / 2);
+        const rect = widgets.Rect{
+            .x = area.x + col * cell_w,
+            .y = area.y + row * cell_h,
+            .width = if (col == 1) area.width - cell_w else cell_w,
+            .height = if (row == 1) area.height - cell_h else cell_h,
+        };
+        if (cell) |s| drawSessionBox(frame, rect, s) else drawEmptyBox(frame, rect);
     }
+    if (pages > 1) drawPageIndicator(frame, page, pages, total_active);
 }
 
-fn drawTodayStrip(frame: Frame, y: u16) u16 {
-    const report = frame.cache.report;
-    const today_key = stats_mod.dayKeyFromMs(frame.now_ms) orelse 0;
-    var today = stats_mod.DayAgg{};
-    for (report.days) |day| {
-        if (day.day_key == today_key) {
-            today = .{ .prompts = day.prompts, .tool_calls = day.tool_calls, .failures = day.failures, .tokens = day.tokens };
-        }
-    }
-    var token_buf: [16]u8 = undefined;
-    var buf: [128]u8 = undefined;
-    const left = std.fmt.bufPrint(&buf, " TODAY ▸ {d} prompts · {d} tool calls · ✗{d} · {s} tokens out", .{
-        today.prompts,
-        today.tool_calls,
-        today.failures,
-        widgets.formatTokens(&token_buf, today.tokens.output),
-    }) catch "";
-    _ = frame.screen.writeText(frame.area.x, y, left, theme.text, frame.area.width);
-
-    var right_token_buf: [16]u8 = undefined;
-    var right_buf: [64]u8 = undefined;
-    const right = std.fmt.bufPrint(&right_buf, "14d: {d} prompts · {s} out ", .{
-        report.totals.prompts,
-        widgets.formatTokens(&right_token_buf, report.totals.tokens.output),
-    }) catch "";
-    if (frame.area.width > left.len + right.len + 2) {
-        _ = frame.screen.writeText(@intCast(frame.area.x + frame.area.width - right.len), y, right, theme.faint, @intCast(right.len));
-    }
-    return 1;
-}
-
-fn drawActivePanel(frame: Frame, rect: widgets.Rect, s: index_mod.SessionSummary) Allocator.Error!void {
+fn drawSessionBox(frame: Frame, rect: widgets.Rect, s: index_mod.SessionSummary) void {
     const screen = frame.screen;
-    const border = widgets.statusStyle(s.status);
-    widgets.drawBoxHeavy(screen, rect, s.project, border);
+    widgets.drawBoxHeavy(screen, rect, s.project, widgets.statusStyle(s.status));
     const inner = rect.inner();
-    if (inner.width < 20 or inner.height < 3) return;
+    if (inner.width < 24 or inner.height < 4) return;
 
     var y = inner.y;
-    var x = screen.writeText(inner.x, y, widgets.statusLabel(s.status), widgets.statusStyle(s.status), 12);
+    var x = if (s.status == .working)
+        drawWorkingPulse(screen, inner, y, frame.now_ms)
+    else
+        screen.writeText(inner.x, y, widgets.statusLabel(s.status), widgets.statusStyle(s.status), 12);
     if (s.waiting_for.len > 0) {
         x += screen.writeText(inner.x + x, y, " ⌁ ", theme.faint, 3);
-        x += screen.writeText(inner.x + x, y, s.waiting_for, theme.amber, inner.width -| x);
+        x += screen.writeText(inner.x + x, y, s.waiting_for, theme.amber, inner.width -| x -| 24);
     }
-    drawPanelStats(frame, inner, y, s);
-    y += 1;
-
-    if (s.last_prompt.len > 0 and y < inner.y + inner.height) {
-        var used = screen.writeText(inner.x, y, "» ", theme.accent_bold, 2);
-        used += screen.writeText(inner.x + used, y, firstLine(s.last_prompt), theme.accent, inner.width -| used);
-        y += 1;
-    }
-    if (s.last_activity.len > 0 and y < inner.y + inner.height) {
-        var used = screen.writeText(inner.x, y, "▶ ", theme.text_bold, 2);
-        used += screen.writeText(inner.x + used, y, firstLine(s.last_activity), theme.text, inner.width -| used);
-        y += 1;
-    }
-
-    if (y + 1 >= inner.y + inner.height) return;
-    _ = screen.writeText(inner.x, y, "─ activity ", theme.faint, inner.width);
-    y += 1;
-
-    const rows: usize = inner.y + inner.height - y;
-    const groups = try groupActivity(frame, s.id, rows);
-    for (groups) |group| {
-        drawGroupRow(frame, inner, y, group);
-        y += 1;
-    }
-}
-
-fn drawPanelStats(frame: Frame, inner: widgets.Rect, y: u16, s: index_mod.SessionSummary) void {
-    var token_bufs: [3][16]u8 = undefined;
-    var buf: [128]u8 = undefined;
     const model = shortModel(s.model);
-    const text = std.fmt.bufPrint(&buf, "{s} · in {s} · out {s} · cache {s} · {d}⚙", .{
-        model[0..@min(model.len, 20)],
+    writeRight(screen, inner, y, x, model[0..@min(model.len, 22)], theme.faint);
+    y += 2;
+
+    var token_bufs: [3][16]u8 = undefined;
+    var value_buf: [96]u8 = undefined;
+    const tokens_text = std.fmt.bufPrint(&value_buf, "in {s} · out {s} · cache {s}", .{
         widgets.formatTokens(&token_bufs[0], s.tokens.input),
         widgets.formatTokens(&token_bufs[1], s.tokens.output),
         widgets.formatTokens(&token_bufs[2], s.tokens.cache_read),
-        s.tool_call_count,
-    }) catch return;
-    if (inner.width > text.len + 14) {
-        _ = frame.screen.writeText(@intCast(inner.x + inner.width - text.len), y, text, theme.faint, @intCast(text.len));
+    }) catch "";
+    y = drawStatRow(screen, inner, y, "tokens", tokens_text, theme.text);
+
+    var usd_buf: [16]u8 = undefined;
+    const cost_text = if (pricing.costUsd(s.model, s.tokens)) |usd|
+        widgets.formatUsd(&usd_buf, usd)
+    else
+        "-";
+    y = drawStatRow(screen, inner, y, "cost", cost_text, theme.text_bold);
+
+    var prompt_buf: [12]u8 = undefined;
+    const prompts_text = std.fmt.bufPrint(&prompt_buf, "{d}", .{s.prompt_count}) catch "";
+    y = drawStatRow(screen, inner, y, "prompts", prompts_text, theme.text);
+
+    var duration_buf: [24]u8 = undefined;
+    y = drawStatRow(screen, inner, y, "session", widgets.formatDuration(&duration_buf, s.first_ts_ms, s.last_ts_ms), theme.text);
+
+    drawConfigRows(screen, inner, y, findAudit(frame.cache.audits, s.cwd));
+}
+
+const pulse_width: u16 = 12;
+const pulse_step_ms: i64 = 90;
+
+/// A bright dot sweeping back and forth along a dim line — the "this session
+/// is doing something right now" heartbeat. Driven by the frame clock, so the
+/// diff renderer repaints only the few cells that moved.
+fn drawWorkingPulse(screen: *render.Screen, inner: widgets.Rect, y: u16, now_ms: i64) u16 {
+    if (inner.width < pulse_width) return 0;
+    const steps: i64 = 2 * (@as(i64, pulse_width) - 1);
+    const step = @mod(@divFloor(now_ms, pulse_step_ms), steps);
+    const pos: i64 = if (step < pulse_width) step else steps - step;
+    var i: u16 = 0;
+    while (i < pulse_width) : (i += 1) {
+        const dist = @abs(@as(i64, i) - pos);
+        const glyph: []const u8 = if (dist == 0) "●" else if (dist == 1) "━" else "─";
+        const style = if (dist == 0) theme.text_bold else if (dist == 1) theme.text else theme.faint;
+        _ = screen.writeText(inner.x + i, y, glyph, style, 1);
     }
+    return pulse_width;
 }
 
-const GroupTag = @import("../../core/session.zig").ActivityKind;
+fn drawConfigRows(screen: *render.Screen, inner: widgets.Rect, y_start: u16, project_audit: ?audit_mod.ProjectAudit) void {
+    const bottom = inner.y + inner.height;
+    var y = y_start;
+    if (y >= bottom) return;
+    _ = screen.writeText(inner.x, y, "─ project config ", theme.faint, inner.width);
+    y += 1;
+    if (y >= bottom) return;
 
-const Group = struct {
-    tag: GroupTag,
-    tool: []const u8 = "",
-    text: []const u8 = "",
-    count: u32 = 1,
-    failed: u32 = 0,
-    last_ts: i64 = 0,
-};
+    const a = project_audit orelse {
+        _ = screen.writeText(inner.x, y, "no audit data", theme.faint, inner.width);
+        return;
+    };
 
-/// Collapses the session's activity ring into human-scale steps: consecutive
-/// calls to the same tool merge into one row with a count, failures fold into
-/// the row they belong to, subagent chatter becomes a single line.
-fn groupActivity(frame: Frame, session_id: []const u8, limit: usize) Allocator.Error![]Group {
-    const steps = try frame.daemon.index.sessionActivity(frame.daemon.io, frame.arena, session_id);
-    var groups: std.ArrayList(Group) = .empty;
-
-    for (steps) |step| {
-        switch (step.kind) {
-            .prompt => try groups.append(frame.arena, .{ .tag = .prompt, .text = step.text, .last_ts = step.ts_ms }),
-            .responded, .subagent => try appendOrMerge(frame.arena, &groups, .{ .tag = step.kind, .count = step.count, .last_ts = step.ts_ms }),
-            .tool => {
-                const last = if (groups.items.len > 0) &groups.items[groups.items.len - 1] else null;
-                if (last != null and last.?.tag == .tool and std.mem.eql(u8, last.?.tool, step.tool)) {
-                    last.?.count += step.count;
-                    last.?.text = step.text;
-                    last.?.last_ts = step.ts_ms;
-                    last.?.failed += step.failed;
-                } else {
-                    try groups.append(frame.arena, .{
-                        .tag = .tool,
-                        .tool = step.tool,
-                        .text = step.text,
-                        .count = step.count,
-                        .last_ts = step.ts_ms,
-                        .failed = step.failed,
-                    });
-                }
-            },
-        }
+    const score = a.qualityScore();
+    var bar_buf: [32]u8 = undefined;
+    var len: usize = 0;
+    var i: u8 = 0;
+    while (i < audit_mod.ProjectAudit.quality_max) : (i += 1) {
+        const glyph = if (i < score) "▮" else "▯";
+        @memcpy(bar_buf[len .. len + glyph.len], glyph);
+        len += glyph.len;
     }
+    const suffix = std.fmt.bufPrint(bar_buf[len..], " {d}/{d}", .{ score, audit_mod.ProjectAudit.quality_max }) catch "";
+    const bar_style = if (score >= 4) theme.text_bold else if (score >= 2) theme.amber else theme.alert;
+    y = drawStatRow(screen, inner, y, "quality", bar_buf[0 .. len + suffix.len], bar_style);
+    if (y >= bottom) return;
 
-    // Sort by recency, not ring order: subagent transcripts backfill after the
-    // main file, so their entries land out of chronological ring position.
-    std.sort.pdq(Group, groups.items, {}, newestFirst);
-    if (groups.items.len > limit) groups.shrinkRetainingCapacity(limit);
-    return groups.items;
+    var x = screen.writeText(inner.x, y, "CLAUDE.md ", theme.text, 10);
+    x += screen.writeText(
+        inner.x + x,
+        y,
+        if (a.has_claude_md) "✓" else "✗",
+        if (a.has_claude_md) theme.text_bold else theme.alert,
+        2,
+    );
+    var counts_buf: [64]u8 = undefined;
+    const skills_agents = std.fmt.bufPrint(&counts_buf, " · {d} skills · {d} agents", .{
+        a.skill_count,
+        a.agent_count,
+    }) catch "";
+    _ = screen.writeText(inner.x + x, y, skills_agents, theme.text, inner.width -| x);
+    y += 1;
+    if (y >= bottom) return;
+
+    const rest = std.fmt.bufPrint(&counts_buf, "{d} mcp · {d} plugins", .{
+        a.mcp_server_count,
+        a.plugin_count,
+    }) catch "";
+    _ = screen.writeText(inner.x, y, rest, theme.text, inner.width);
 }
 
-fn newestFirst(_: void, a: Group, b: Group) bool {
-    return a.last_ts > b.last_ts;
+fn drawStatRow(screen: *render.Screen, inner: widgets.Rect, y: u16, label: []const u8, value: []const u8, style: render.Style) u16 {
+    const bottom = inner.y + inner.height;
+    if (y >= bottom) return y;
+    _ = screen.writeText(inner.x, y, label, theme.faint, 8);
+    _ = screen.writeText(inner.x + 9, y, value, style, inner.width -| 9);
+    return y + 1;
 }
 
-fn appendOrMerge(arena: Allocator, groups: *std.ArrayList(Group), group: Group) Allocator.Error!void {
-    if (groups.items.len > 0) {
-        const last = &groups.items[groups.items.len - 1];
-        if (last.tag == group.tag) {
-            last.count += group.count;
-            last.last_ts = group.last_ts;
-            return;
-        }
-    }
-    try groups.append(arena, group);
+fn drawEmptyBox(frame: Frame, rect: widgets.Rect) void {
+    widgets.drawBox(frame.screen, rect, "", theme.faint);
+    const inner = rect.inner();
+    const label = "no session";
+    if (inner.width <= label.len or inner.height < 1) return;
+    const x = inner.x + @as(u16, @intCast((inner.width - label.len) / 2));
+    _ = frame.screen.writeText(x, inner.y + inner.height / 2, label, theme.faint, @intCast(label.len));
 }
 
-fn drawGroupRow(frame: Frame, inner: widgets.Rect, y: u16, group: Group) void {
-    const screen = frame.screen;
-    var x: u16 = 0;
-    switch (group.tag) {
-        .prompt => {
-            x += screen.writeText(inner.x, y, "» ", theme.accent_bold, 2);
-            x += screen.writeText(inner.x + x, y, firstLine(group.text), theme.accent, inner.width -| x -| 5);
-        },
-        .responded => {
-            x += screen.writeText(inner.x, y, "◆ responded", theme.text, 12);
-            x += drawCount(screen, inner, y, x, group.count);
-        },
-        .subagent => {
-            x += screen.writeText(inner.x, y, "⇉ subagent activity", theme.faint, 20);
-            x += drawCount(screen, inner, y, x, group.count);
-        },
-        .tool => {
-            x += screen.writeText(inner.x, y, "⚙ ", theme.text, 2);
-            x += screen.writeText(inner.x + x, y, group.tool, theme.text_bold, 14);
-            x += drawCount(screen, inner, y, x, group.count);
-            if (group.failed > 0) {
-                var fail_buf: [12]u8 = undefined;
-                const fail = std.fmt.bufPrint(&fail_buf, " ✗{d}", .{group.failed}) catch "";
-                x += screen.writeText(inner.x + x, y, fail, theme.alert, 6);
-            }
-            if (group.text.len > 0 and inner.width > x + 8) {
-                x += screen.writeText(inner.x + x, y, " · ", theme.faint, 3);
-                x += screen.writeText(inner.x + x, y, firstLine(group.text), theme.text, inner.width -| x -| 5);
-            }
-        },
-    }
-    var ago_buf: [16]u8 = undefined;
-    const ago = widgets.formatAgo(&ago_buf, frame.now_ms, group.last_ts);
-    if (inner.width > ago.len + 1) {
-        _ = screen.writeText(@intCast(inner.x + inner.width - ago.len), y, ago, theme.faint, @intCast(ago.len));
-    }
-}
-
-fn drawCount(screen: *render.Screen, inner: widgets.Rect, y: u16, x: u16, count: u32) u16 {
-    if (count < 2) return 0;
-    var buf: [12]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, " ×{d}", .{count}) catch return 0;
-    return screen.writeText(inner.x + x, y, text, theme.text_bold, 6);
-}
-
-fn drawIdleStrip(frame: Frame, y_start: u16, idle: []const index_mod.SessionSummary, idle_total: usize) void {
-    const screen = frame.screen;
+fn drawPageIndicator(frame: Frame, page: usize, pages: usize, total_active: usize) void {
     const area = frame.area;
-    var header_buf: [48]u8 = undefined;
-    const header = std.fmt.bufPrint(&header_buf, "─ idle sessions ({d}) ", .{idle_total}) catch "";
-    _ = screen.writeText(area.x, y_start, header, theme.faint, area.width);
-
-    for (idle, 0..) |s, i| {
-        const y = y_start + 1 + @as(u16, @intCast(i));
-        var x = screen.writeText(area.x + 1, y, "○ ", .{ .fg = .bright_cyan }, 2);
-        x += screen.writeText(area.x + 1 + x, y, s.project, theme.text, 22);
-        x += screen.writeText(area.x + 1 + x, y, "  ", .{}, 2);
-        const label = if (s.title.len > 0) s.title else s.last_activity;
-        _ = screen.writeText(area.x + 1 + x, y, firstLine(label), theme.faint, area.width -| x -| 8);
-        var ago_buf: [16]u8 = undefined;
-        const ago = widgets.formatAgo(&ago_buf, frame.now_ms, s.last_ts_ms);
-        if (area.width > ago.len + 1) {
-            _ = screen.writeText(@intCast(area.x + area.width - ago.len - 1), y, ago, theme.faint, @intCast(ago.len));
-        }
-    }
+    var buf: [64]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, " page {d}/{d} · {d} active · press 1-{d} ", .{
+        page + 1,
+        pages,
+        total_active,
+        @min(pages, 9),
+    }) catch return;
+    if (area.width <= text.len + 4) return;
+    const y = area.y + area.height - 1;
+    _ = frame.screen.writeText(@intCast(area.x + area.width - text.len - 2), y, text, theme.amber, @intCast(text.len));
 }
 
 fn drawEmptyState(frame: Frame) void {
@@ -307,6 +219,18 @@ fn drawEmptyState(frame: Frame) void {
     _ = frame.screen.writeText(center(area, line2.len), mid + 1, line2, theme.faint, area.width);
 }
 
+fn writeRight(screen: *render.Screen, inner: widgets.Rect, y: u16, used_left: u16, text: []const u8, style: render.Style) void {
+    if (inner.width <= used_left + text.len + 2) return;
+    _ = screen.writeText(@intCast(inner.x + inner.width - text.len), y, text, style, @intCast(text.len));
+}
+
+fn findAudit(audits: []const audit_mod.ProjectAudit, cwd: []const u8) ?audit_mod.ProjectAudit {
+    for (audits) |a| {
+        if (std.mem.eql(u8, a.cwd, cwd)) return a;
+    }
+    return null;
+}
+
 fn center(area: widgets.Rect, text_len: usize) u16 {
     if (area.width <= text_len) return area.x;
     return area.x + @as(u16, @intCast((area.width - text_len) / 2));
@@ -316,9 +240,4 @@ fn shortModel(model: []const u8) []const u8 {
     const prefix = "claude-";
     if (std.mem.startsWith(u8, model, prefix)) return model[prefix.len..];
     return model;
-}
-
-fn firstLine(text: []const u8) []const u8 {
-    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    return text[0..end];
 }

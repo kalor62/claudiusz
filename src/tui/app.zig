@@ -11,6 +11,7 @@ const Io = std.Io;
 const daemon_mod = @import("../daemon.zig");
 const term_mod = @import("../infra/term.zig");
 const project_scanner = @import("../infra/project_scanner.zig");
+const claude_stats = @import("../infra/claude_stats.zig");
 const render = @import("render.zig");
 const widgets = @import("widgets.zig");
 const index_mod = @import("../core/index.zig");
@@ -18,6 +19,7 @@ const stats_mod = @import("../core/stats.zig");
 const tips_mod = @import("../core/tips.zig");
 const audit_mod = @import("../core/audit.zig");
 const live_view = @import("views/live.zig");
+const help_view = @import("views/help.zig");
 const sessions_view = @import("views/sessions.zig");
 const stats_view = @import("views/stats.zig");
 const tips_view = @import("views/tips.zig");
@@ -35,6 +37,7 @@ pub const Tab = enum {
     tips,
     projects,
     stats,
+    help,
 
     fn label(t: Tab) []const u8 {
         return switch (t) {
@@ -43,6 +46,7 @@ pub const Tab = enum {
             .tips => "TIPS",
             .projects => "PROJECTS",
             .stats => "STATS",
+            .help => "HELP",
         };
     }
 };
@@ -57,6 +61,8 @@ pub const Frame = struct {
     area: widgets.Rect,
     sessions: []const index_mod.SessionSummary,
     cache: *const ViewCache,
+    live_page: usize = 0,
+    help_page: usize = 0,
 };
 
 /// Audits, tips and the stats report are too expensive to rebuild at frame
@@ -68,6 +74,8 @@ pub const ViewCache = struct {
     report: stats_mod.Report = undefined,
     audits: []const audit_mod.ProjectAudit = &.{},
     tips: []const tips_mod.Tip = &.{},
+    weekly: claude_stats.Summary = .{},
+    limit_bars: []const claude_stats.LimitBar = &.{},
 
     fn refresh(
         cache: *ViewCache,
@@ -85,6 +93,8 @@ pub const ViewCache = struct {
             .sessions = sessions,
             .audits = cache.audits,
         });
+        cache.weekly = claude_stats.load(arena, daemon.io, daemon.cfg.root, 8);
+        cache.limit_bars = claude_stats.loadLimits(arena, daemon.io, daemon.cfg.root, cache.weekly);
         cache.built_at_ms = now_ms;
     }
 };
@@ -97,6 +107,10 @@ pub const App = struct {
     cache: ViewCache,
     tab: Tab = .live,
     selected: usize = 0,
+    live_page: usize = 0,
+    /// Page count as of the last drawn frame; digit keys page when > 1.
+    live_pages: usize = 1,
+    help_page: usize = 0,
     /// Session id whose detail panel is open; owned by `gpa`.
     detail_session: ?[]const u8 = null,
     /// Session ids as last drawn by the sessions table, for selection.
@@ -144,11 +158,7 @@ pub const App = struct {
                     }
                     return true;
                 },
-                '1' => app.switchTab(.live),
-                '2' => app.switchTab(.sessions),
-                '3' => app.switchTab(.tips),
-                '4' => app.switchTab(.projects),
-                '5' => app.switchTab(.stats),
+                '1'...'9' => app.handleDigit(c),
                 'j' => app.moveSelection(1),
                 'k' => app.moveSelection(-1),
                 else => {},
@@ -161,6 +171,22 @@ pub const App = struct {
             .escape => app.closeDetail(),
         }
         return false;
+    }
+
+    /// On paginated views (live with >4 sessions, help) digits jump between
+    /// pages; everywhere else they switch tabs (arrows always switch tabs).
+    fn handleDigit(app: *App, c: u8) void {
+        const digit: usize = c - '1';
+        if (app.tab == .live and app.live_pages > 1) {
+            if (digit < app.live_pages) app.live_page = digit;
+            return;
+        }
+        if (app.tab == .help) {
+            if (digit < help_view.page_count) app.help_page = digit;
+            return;
+        }
+        const tab_count = @typeInfo(Tab).@"enum".fields.len;
+        if (digit < tab_count) app.switchTab(@enumFromInt(digit));
     }
 
     fn switchTab(app: *App, tab: Tab) void {
@@ -221,6 +247,9 @@ pub const App = struct {
         const sessions = try app.daemon.index.listSessions(app.daemon.io, arena);
         try app.cache.refresh(app.daemon, sessions, now_ms);
 
+        app.live_pages = @max(live_view.pageCount(sessions), 1);
+        if (app.live_page >= app.live_pages) app.live_page = app.live_pages - 1;
+
         const frame = Frame{
             .arena = arena,
             .screen = &app.screen,
@@ -229,16 +258,19 @@ pub const App = struct {
             .area = .{ .x = 0, .y = 1, .width = size.width, .height = size.height - 2 },
             .sessions = sessions,
             .cache = &app.cache,
+            .live_page = app.live_page,
+            .help_page = app.help_page,
         };
 
         app.drawHeader(frame);
         app.drawFooter(size.height - 1);
         switch (app.tab) {
-            .live => try live_view.draw(frame),
+            .live => live_view.draw(frame),
             .sessions => try app.drawSessions(frame),
             .tips => tips_view.draw(frame),
             .projects => projects_view.draw(frame),
             .stats => stats_view.draw(frame),
+            .help => help_view.draw(frame),
         }
 
         app.term.writeOut(try app.screen.renderDiff());
@@ -304,8 +336,10 @@ pub const App = struct {
         app.screen.fillRow(y, " ", widgets.theme.faint);
         const hints = if (app.detail_session != null)
             " esc back · q close"
+        else if ((app.tab == .live and app.live_pages > 1) or app.tab == .help)
+            " q quit · ←→ tabs · 1-9 page · j/k select · ⏎ detail"
         else
-            " q quit · 1-5/←→ tabs · j/k select · ⏎ detail";
+            " q quit · 1-6/←→ tabs · j/k select · ⏎ detail";
         _ = app.screen.writeText(0, y, hints, widgets.theme.faint, app.screen.width);
         var buf: [32]u8 = undefined;
         const right = std.fmt.bufPrint(&buf, "api :{d} · v{s} ", .{ app.daemon.cfg.port, root_mod.version }) catch |err| {

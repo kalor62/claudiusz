@@ -64,6 +64,23 @@ pub fn hourFromMs(timestamp_ms: i64) u5 {
     return @intCast(@divFloor(@mod(seconds, 86_400), 3_600));
 }
 
+/// UTC day index for a calendar date (Hinnant's days-from-civil).
+pub fn dayKeyFromYmd(year: i32, month: u4, day: u5) i32 {
+    const y: i64 = if (month <= 2) year - 1 else year;
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const mp: i64 = if (month > 2) month - 3 else @as(i64, month) + 9;
+    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return @intCast(era * 146_097 + doe - 719_468);
+}
+
+/// Day key of the Monday starting the week that contains `day_key`.
+pub fn weekStart(day_key: i32) i32 {
+    // Day 0 (1970-01-01) was a Thursday, so +3 makes Monday index 0.
+    return day_key - @mod(day_key + 3, 7);
+}
+
 /// Formats a day key as "YYYY-MM-DD" (inverse of Hinnant's days-from-civil).
 pub fn formatDayKey(buf: *[10]u8, day_key: i32) []const u8 {
     const z: i64 = @as(i64, day_key) + 719_468;
@@ -93,6 +110,17 @@ test "day keys round-trip through civil dates" {
     try testing.expectEqualStrings("2026-07-07", formatDayKey(&buf, key));
     try testing.expectEqualStrings("1970-01-01", formatDayKey(&buf, 0));
     try testing.expectEqualStrings("2000-02-29", formatDayKey(&buf, dayKeyFromMs(time_mod.parseIso8601Ms("2000-02-29T12:00:00Z").?).?));
+}
+
+test "dayKeyFromYmd inverts formatDayKey and weekStart lands on Mondays" {
+    try testing.expectEqual(@as(i32, 0), dayKeyFromYmd(1970, 1, 1));
+    var buf: [10]u8 = undefined;
+    const key = dayKeyFromYmd(2026, 7, 7);
+    try testing.expectEqualStrings("2026-07-07", formatDayKey(&buf, key));
+    try testing.expectEqual(dayKeyFromYmd(2026, 7, 6), weekStart(key));
+    // A Monday is its own week start; Sunday belongs to the previous Monday.
+    try testing.expectEqual(dayKeyFromYmd(2026, 7, 6), weekStart(dayKeyFromYmd(2026, 7, 6)));
+    try testing.expectEqual(dayKeyFromYmd(2026, 7, 6), weekStart(dayKeyFromYmd(2026, 7, 12)));
 }
 
 test "hourFromMs extracts the UTC hour" {

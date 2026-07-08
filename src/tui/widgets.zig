@@ -114,6 +114,25 @@ pub fn formatTokens(buf: []u8, count: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{d}.{d}M", .{ whole, tenth }) catch buf[0..0];
 }
 
+/// Formats a dollar amount into at most 7 columns: $0.42, $12.3, $123.
+pub fn formatUsd(buf: []u8, usd: f64) []const u8 {
+    if (usd < 10) return std.fmt.bufPrint(buf, "${d:.2}", .{usd}) catch "$?";
+    if (usd < 100) return std.fmt.bufPrint(buf, "${d:.1}", .{usd}) catch "$?";
+    return std.fmt.bufPrint(buf, "${d:.0}", .{usd}) catch "$?";
+}
+
+/// Formats a session's wall-clock span: 45s, 12m 5s, 3h 20m, 2d 4h.
+pub fn formatDuration(buf: []u8, first_ms: i64, last_ms: i64) []const u8 {
+    if (first_ms <= 0 or last_ms <= first_ms) return "-";
+    const seconds = @divFloor(last_ms - first_ms, 1000);
+    if (seconds < 60) return std.fmt.bufPrint(buf, "{d}s", .{seconds}) catch "-";
+    const minutes = @divFloor(seconds, 60);
+    if (minutes < 60) return std.fmt.bufPrint(buf, "{d}m {d}s", .{ minutes, @mod(seconds, 60) }) catch "-";
+    const hours = @divFloor(minutes, 60);
+    if (hours < 24) return std.fmt.bufPrint(buf, "{d}h {d}m", .{ hours, @mod(minutes, 60) }) catch "-";
+    return std.fmt.bufPrint(buf, "{d}d {d}h", .{ @divFloor(hours, 24), @mod(hours, 24) }) catch "-";
+}
+
 /// Formats "how long ago" into at most 4 columns: 12s, 5m, 3h, 2d.
 pub fn formatAgo(buf: []u8, now_ms: i64, then_ms: i64) []const u8 {
     if (then_ms <= 0) return "-";
@@ -133,6 +152,23 @@ test "formatTokens compacts large numbers" {
     try testing.expectEqualStrings("999", formatTokens(&buf, 999));
     try testing.expectEqualStrings("12.3k", formatTokens(&buf, 12_345));
     try testing.expectEqualStrings("18.1M", formatTokens(&buf, 18_102_911));
+}
+
+test "formatUsd narrows precision as amounts grow" {
+    var buf: [16]u8 = undefined;
+    try testing.expectEqualStrings("$0.42", formatUsd(&buf, 0.421));
+    try testing.expectEqualStrings("$12.3", formatUsd(&buf, 12.34));
+    try testing.expectEqualStrings("$123", formatUsd(&buf, 123.4));
+}
+
+test "formatDuration spans seconds to days" {
+    var buf: [24]u8 = undefined;
+    try testing.expectEqualStrings("45s", formatDuration(&buf, 1_000, 46_000));
+    try testing.expectEqualStrings("12m 5s", formatDuration(&buf, 1_000, 726_000));
+    try testing.expectEqualStrings("3h 20m", formatDuration(&buf, 1_000, 12_001_000));
+    try testing.expectEqualStrings("2d 4h", formatDuration(&buf, 1_000, 187_201_000));
+    try testing.expectEqualStrings("-", formatDuration(&buf, 10, 10));
+    try testing.expectEqualStrings("-", formatDuration(&buf, 0, 45_000));
 }
 
 test "formatAgo picks the coarsest sensible unit" {

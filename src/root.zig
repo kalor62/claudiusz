@@ -5,7 +5,7 @@
 
 const std = @import("std");
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 pub const cli = @import("cli.zig");
 pub const config = @import("config.zig");
@@ -15,11 +15,14 @@ pub const parser = @import("core/parser.zig");
 pub const session = @import("core/session.zig");
 pub const index = @import("core/index.zig");
 pub const stats = @import("core/stats.zig");
+pub const pricing = @import("core/pricing.zig");
 pub const digest = @import("core/digest.zig");
 pub const tips = @import("core/tips.zig");
 pub const audit = @import("core/audit.zig");
 pub const time = @import("core/time.zig");
 pub const project_scanner = @import("infra/project_scanner.zig");
+pub const snapshot = @import("infra/snapshot.zig");
+pub const claude_stats = @import("infra/claude_stats.zig");
 pub const api = @import("api/handlers.zig");
 pub const claude_dirs = @import("infra/claude_dirs.zig");
 pub const liveness = @import("infra/liveness.zig");

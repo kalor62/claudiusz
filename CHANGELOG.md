@@ -5,17 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-07-08
+
+### Added
+
+- Startup snapshot cache: index aggregates and watcher offsets persist to the
+  OS cache dir and are restored after one `stat()` per transcript, so warm
+  starts take milliseconds instead of re-parsing the full history. Transcripts
+  are validated per file (append-only offsets, mtime); any contradiction falls
+  back to a full rebuild. `--no-cache` forces the rebuild.
+- Estimated USD cost per session (`core/pricing.zig`): per-model rates with
+  cache read/write factors, shown in live boxes.
+- Project config audit now counts skills, agents, MCP servers and enabled
+  plugins, and scores quality 0–5 (CLAUDE.md, settings, skills, agents, MCP).
+  CLAUDE.md only counts when it carries real content — empty files and bare
+  markdown headers score nothing.
+- HELP tab: a built-in four-page user manual in the same quarter-screen box
+  grid as LIVE (keys, live view, HTTP API usage, cost/limits/CLI), digit keys
+  jump between pages.
+- STATS: weekly usage history read from Claude Code's own `stats-cache.json`
+  (messages, sessions, tool calls, tokens and top models per week, lifetime
+  totals) — reaches further back than the transcripts themselves.
+- STATS: optional weekly limit progress bars driven by user-calibrated budgets
+  in `<root>/claudiusz.json` (`weekly_limits`, `week_reset_day`); the section
+  stays hidden when unconfigured (e.g. enterprise plans without weekly caps).
 
 ### Changed
 
-- Live tab rebuilt as a mission-control dashboard: large double-framed panels
-  for active sessions (status, current step, last prompt, token stats) with
-  recent work grouped into human-scale steps (`Edit ×3`, failures marked ✗),
-  a today-totals strip, and a compact idle-session list — replacing the raw
-  event feed. Phosphor-green theme with cyan/amber accents.
-- Header tabs are now unnumbered (LIVE / SESSIONS / TIPS / PROJECTS / STATS);
-  1-5 shortcuts unchanged.
+- Live tab rebuilt as a fixed 2×2 mission-control grid: each active session is
+  one quarter-screen box showing only the vitals — tokens, estimated cost,
+  prompt count, session length, and the project's Claude config (quality bar,
+  CLAUDE.md ✓/✗, skills/agents/MCP/plugins counts). More than four active
+  sessions paginate with digit keys; a working session shows a pulsing line
+  instead of a status label. The raw activity feed, today strip and idle list
+  are gone.
+- Header tabs are now unnumbered (LIVE / SESSIONS / TIPS / PROJECTS / STATS /
+  HELP); digit shortcuts switch tabs, or pages on paginated views.
 - Session status is authoritative from Claude Code's state file (`busy` means
   working even mid-long-turn); the stale-heartbeat downgrade is gone.
 - `SessionSummary.status` is a typed enum end-to-end (same JSON wire format).

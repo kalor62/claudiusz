@@ -53,6 +53,36 @@ pub const Watcher = struct {
         w.* = undefined;
     }
 
+    pub const OffsetEntry = struct {
+        path: []const u8,
+        offset: u64,
+        skip_to_newline: bool = false,
+    };
+
+    /// Pre-seeds a file's consumed offset (snapshot restore). Must run before
+    /// the first tick; an already-tracked path keeps its existing state.
+    pub fn seedOffset(w: *Watcher, entry: OffsetEntry) Allocator.Error!void {
+        if (w.files.contains(entry.path)) return;
+        const key = try w.gpa.dupe(u8, entry.path);
+        errdefer w.gpa.free(key);
+        try w.files.put(key, .{ .offset = entry.offset, .skip_to_newline = entry.skip_to_newline });
+    }
+
+    /// Arena-copied view of every tracked file's consumed offset.
+    pub fn exportOffsets(w: *const Watcher, arena: Allocator) Allocator.Error![]OffsetEntry {
+        var out = try arena.alloc(OffsetEntry, w.files.count());
+        var it = w.files.iterator();
+        var i: usize = 0;
+        while (it.next()) |entry| : (i += 1) {
+            out[i] = .{
+                .path = try arena.dupe(u8, entry.key_ptr.*),
+                .offset = entry.value_ptr.offset,
+                .skip_to_newline = entry.value_ptr.skip_to_newline,
+            };
+        }
+        return out;
+    }
+
     /// One poll cycle. `handler` must provide:
     /// `fn onLine(handler, path: []const u8, line: []const u8) void`.
     /// The `line` slice is only valid during the call.
