@@ -13,6 +13,21 @@ Everything runs locally. Nothing leaves your machine. The API binds to `127.0.0.
 
 ## Install
 
+### From a release (no toolchain needed)
+
+Grab the archive for your platform from [Releases](https://github.com/kalor62/claudiusz/releases), then:
+
+```sh
+tar -xzf claudiusz-*-macos-arm64.tar.gz
+xattr -d com.apple.quarantine claudiusz   # macOS: clear the Gatekeeper quarantine
+mv claudiusz /usr/local/bin/
+claudiusz
+```
+
+Releases currently ship a macOS arm64 binary; on other platforms build from source below.
+
+### From source
+
 Requires [Zig](https://ziglang.org) 0.16+.
 
 ```sh
