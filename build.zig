@@ -8,6 +8,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        // std.c is used for raw terminal I/O and process liveness checks, so
+        // cross-compiled targets must link libc explicitly.
+        .link_libc = true,
     });
 
     const exe = b.addExecutable(.{
@@ -16,6 +19,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
             .imports = &.{
                 .{ .name = "claudiusz", .module = mod },
             },
