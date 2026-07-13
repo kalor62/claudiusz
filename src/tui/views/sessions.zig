@@ -73,6 +73,8 @@ pub fn drawDetail(frame: Frame, session_id: []const u8) Allocator.Error!void {
     y += drawField(screen, inner, y, "session", s.id);
     y += drawField(screen, inner, y, "title", if (s.title.len > 0) s.title else "-");
     y += drawField(screen, inner, y, "cwd", s.cwd);
+    if (index_mod.currentFolder(s.cwd, s.current_dir)) |_|
+        y += drawField(screen, inner, y, "current dir", s.current_dir);
     y += drawField(screen, inner, y, "branch", orDash(detail.git_branch));
     y += drawField(screen, inner, y, "model", orDash(s.model));
     y += drawField(screen, inner, y, "permissions", orDash(detail.permission_mode));

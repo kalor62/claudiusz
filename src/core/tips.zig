@@ -213,6 +213,7 @@ fn sessionTemplate() index_mod.SessionSummary {
         .id = "s",
         .project = "webshop",
         .cwd = "/w/webshop",
+        .current_dir = "/w/webshop",
         .title = "",
         .agent_name = "",
         .status = .done,
