@@ -36,8 +36,6 @@ pub const SessionSummary = struct {
     id: []const u8,
     project: []const u8,
     cwd: []const u8,
-    /// Where the session is working now; equals `cwd` until it changes directory.
-    current_dir: []const u8,
     title: []const u8,
     agent_name: []const u8,
     status: Status,
@@ -102,7 +100,6 @@ pub const EventView = struct {
 pub const SessionExport = struct {
     id: []const u8,
     cwd: []const u8 = "",
-    current_dir: []const u8 = "",
     title: []const u8 = "",
     agent_name: []const u8 = "",
     model: []const u8 = "",
@@ -194,7 +191,6 @@ pub const Index = struct {
             sessions[i] = .{
                 .id = try arena.dupe(u8, s.id),
                 .cwd = try arena.dupe(u8, s.cwd),
-                .current_dir = try arena.dupe(u8, s.current_dir),
                 .title = try arena.dupe(u8, s.title),
                 .agent_name = try arena.dupe(u8, s.agent_name),
                 .model = try arena.dupe(u8, s.model),
@@ -263,8 +259,6 @@ pub const Index = struct {
 
     fn fillSession(gpa: Allocator, s: *Session, snap: SessionExport) Allocator.Error!void {
         s.cwd = try gpa.dupe(u8, snap.cwd);
-        // Older snapshots predate current_dir; fall back to the launch folder.
-        s.current_dir = try gpa.dupe(u8, if (snap.current_dir.len > 0) snap.current_dir else snap.cwd);
         s.title = try gpa.dupe(u8, snap.title);
         s.agent_name = try gpa.dupe(u8, snap.agent_name);
         s.model = try gpa.dupe(u8, snap.model);
@@ -633,7 +627,6 @@ pub const Index = struct {
             .id = try arena.dupe(u8, s.id),
             .project = try arena.dupe(u8, projectName(s.cwd)),
             .cwd = try arena.dupe(u8, s.cwd),
-            .current_dir = try arena.dupe(u8, s.current_dir),
             .title = try arena.dupe(u8, s.title),
             .agent_name = try arena.dupe(u8, s.agent_name),
             .status = s.status,
@@ -679,21 +672,6 @@ pub const Index = struct {
 pub fn projectName(cwd: []const u8) []const u8 {
     if (cwd.len == 0) return "-";
     return std.fs.path.basename(cwd);
-}
-
-/// The folder to surface as "current" when it differs from the launch `cwd`.
-/// Returns null when the session never changed directory (nothing to show).
-/// When `current` is nested under `cwd`, `text` is the relative suffix and
-/// `relative` is set so callers can render it as "./suffix".
-pub const CurrentFolder = struct { text: []const u8, relative: bool };
-pub fn currentFolder(cwd: []const u8, current: []const u8) ?CurrentFolder {
-    if (current.len == 0 or std.mem.eql(u8, cwd, current)) return null;
-    if (cwd.len > 0 and current.len > cwd.len and
-        std.mem.startsWith(u8, current, cwd) and current[cwd.len] == '/')
-    {
-        return .{ .text = current[cwd.len + 1 ..], .relative = true };
-    }
-    return .{ .text = current, .relative = false };
 }
 
 /// Builds the read/wire view of one event.
@@ -747,24 +725,6 @@ fn applyLines(ix: *Index, io: Io, lines: []const []const u8) !void {
         defer testing.allocator.free(events);
         for (events) |e| try ix.applyEvent(io, e);
     }
-}
-
-test "currentFolder hides unchanged dirs and relativizes nested ones" {
-    try testing.expect(currentFolder("/repo", "") == null);
-    try testing.expect(currentFolder("/repo", "/repo") == null);
-
-    const nested = currentFolder("/repo", "/repo/sub/dir").?;
-    try testing.expect(nested.relative);
-    try testing.expectEqualStrings("sub/dir", nested.text);
-
-    const elsewhere = currentFolder("/repo", "/other/place").?;
-    try testing.expect(!elsewhere.relative);
-    try testing.expectEqualStrings("/other/place", elsewhere.text);
-
-    // A sibling that merely shares a prefix is not nested.
-    const sibling = currentFolder("/repo", "/repos").?;
-    try testing.expect(!sibling.relative);
-    try testing.expectEqualStrings("/repos", sibling.text);
 }
 
 test "index aggregates sessions and serves snapshots" {

@@ -216,7 +216,6 @@ test "scan derives projects from sessions and checks their files" {
         .id = "s",
         .project = "p",
         .cwd = "",
-        .current_dir = "",
         .title = "",
         .agent_name = "",
         .status = .done,

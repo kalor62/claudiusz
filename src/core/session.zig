@@ -54,11 +54,7 @@ pub const Status = enum {
 /// passed to the mutating methods; free with `deinit`.
 pub const Session = struct {
     id: []const u8,
-    /// The folder Claude Code launched in — the stable project identity.
     cwd: []const u8 = "",
-    /// Where Claude is working right now, which follows `cd`s away from `cwd`.
-    /// Equal to `cwd` until the session changes directory.
-    current_dir: []const u8 = "",
     title: []const u8 = "",
     agent_name: []const u8 = "",
     model: []const u8 = "",
@@ -105,7 +101,6 @@ pub const Session = struct {
     pub fn deinit(s: *Session, gpa: Allocator) void {
         gpa.free(s.id);
         gpa.free(s.cwd);
-        gpa.free(s.current_dir);
         gpa.free(s.title);
         gpa.free(s.agent_name);
         gpa.free(s.model);
@@ -136,15 +131,8 @@ pub const Session = struct {
             if (s.first_ts_ms == 0 or e.timestamp_ms < s.first_ts_ms) s.first_ts_ms = e.timestamp_ms;
             if (e.timestamp_ms > s.last_ts_ms) s.last_ts_ms = e.timestamp_ms;
         }
-        // Working directory and branch are main-loop facts: subagents run with
-        // their own cwd (e.g. tool-result staging) that must not overwrite the
-        // session's project. `cwd` pins to the launch folder; `current_dir`
-        // follows Claude wherever it `cd`s.
-        if (!e.is_sidechain and e.cwd.len > 0) {
-            if (s.cwd.len == 0) try replace(gpa, &s.cwd, e.cwd);
-            try replaceIfChanged(gpa, &s.current_dir, e.cwd);
-        }
-        if (!e.is_sidechain and e.git_branch.len > 0) try replaceIfChanged(gpa, &s.git_branch, e.git_branch);
+        if (e.cwd.len > 0 and s.cwd.len == 0) try replace(gpa, &s.cwd, e.cwd);
+        if (e.git_branch.len > 0) try replaceIfChanged(gpa, &s.git_branch, e.git_branch);
         if (e.app_version.len > 0 and s.app_version.len == 0) try replace(gpa, &s.app_version, e.app_version);
         if (e.is_sidechain) {
             s.subagent_event_count += 1;
@@ -390,29 +378,4 @@ test "sidechain events count separately and keep main activity" {
     try testing.expectEqual(@as(u32, 1), session.subagent_event_count);
     try testing.expectEqual(@as(u32, 0), session.tool_call_count);
     try testing.expectEqualStrings("reading your prompt", session.last_activity);
-}
-
-test "cwd pins to launch folder while current_dir follows cd" {
-    const gpa = testing.allocator;
-    var session = try Session.init(gpa, "s1");
-    defer session.deinit(gpa);
-
-    const lines = [_][]const u8{
-        \\{"type":"user","message":{"content":"start here"},"timestamp":"2026-07-07T10:00:00Z","cwd":"/repo","sessionId":"s1"}
-        ,
-        // A subagent staging its results elsewhere must not move the session.
-        \\{"type":"assistant","message":{"model":"m","id":"m1","content":[{"type":"tool_use","id":"t","name":"Grep","input":{"pattern":"x"}}]},"timestamp":"2026-07-07T10:00:01Z","cwd":"/repo/.claude/tool-results","sessionId":"s1","isSidechain":true}
-        ,
-        // Claude cd's into a subfolder: current_dir moves, cwd stays.
-        \\{"type":"user","message":{"content":"now here"},"timestamp":"2026-07-07T10:00:02Z","cwd":"/repo/sub","sessionId":"s1"}
-        ,
-    };
-    for (lines) |line| {
-        const events = try parser.parseLine(gpa, line);
-        defer event_mod.freeEvents(gpa, events);
-        for (events) |*e| _ = try session.applyEvent(gpa, e);
-    }
-
-    try testing.expectEqualStrings("/repo", session.cwd);
-    try testing.expectEqualStrings("/repo/sub", session.current_dir);
 }

@@ -79,17 +79,6 @@ fn drawSessionBox(frame: Frame, rect: widgets.Rect, s: index_mod.SessionSummary)
     }
     const model = shortModel(s.model);
     writeRight(screen, inner, y, x, model[0..@min(model.len, 22)], theme.faint);
-
-    // The blank line under the status becomes a "folder" row once the session
-    // has changed directory away from its launch project.
-    if (index_mod.currentFolder(s.cwd, s.current_dir)) |cf| {
-        var folder_buf: [128]u8 = undefined;
-        const folder_text = if (cf.relative)
-            std.fmt.bufPrint(&folder_buf, "./{s}", .{cf.text}) catch cf.text
-        else
-            cf.text;
-        _ = drawStatRow(screen, inner, y + 1, "folder", folder_text, theme.text);
-    }
     y += 2;
 
     var token_bufs: [3][16]u8 = undefined;
