@@ -5,7 +5,7 @@
 
 const std = @import("std");
 
-pub const version = "0.3.0";
+pub const version = "0.3.1";
 
 pub const cli = @import("cli.zig");
 pub const config = @import("config.zig");
